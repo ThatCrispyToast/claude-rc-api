@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Claude Remote Control</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --border: #2a2f3a;
+    --text: #e6e8ee;
+    --muted: #8b93a7;
+    --accent: #d97757;      /* claude terracotta */
+    --accent-dim: #b45c40;
+    --user: #4f8cff;
+    --assistant: #4fd18b;
+    --warn: #e0b341;
+    --danger: #e0555a;
+    --radius: 10px;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: var(--sans); font-size: 14px; line-height: 1.5;
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  }
+  a { color: var(--user); }
+  button {
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px;
+    cursor: pointer; transition: background .12s, border-color .12s;
+  }
+  button:hover:not(:disabled) { background: #262b36; border-color: #3a414f; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #1a1206; font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: var(--accent-dim); border-color: var(--accent-dim); }
+  button.danger:hover:not(:disabled) { background: #3a2226; border-color: var(--danger); color: #ffb3b6; }
+  select {
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; cursor: pointer;
+  }
+  .muted { color: var(--muted); }
+  .mono { font-family: var(--mono); }
+
+  /* ---- top bar ---- */
+  header {
+    display: flex; align-items: center; gap: 14px;
+    padding: 10px 16px; background: var(--panel);
+    border-bottom: 1px solid var(--border); flex: 0 0 auto;
+  }
+  header .logo { font-weight: 700; letter-spacing: .2px; }
+  header .logo .dot { color: var(--accent); }
+  header .spacer { flex: 1; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--muted);
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 999px; padding: 4px 10px;
+  }
+  .chip.bad { color: #ffb3b6; border-color: #5a2a2e; }
+  .chip .k { color: var(--muted); }
+  .chip .v { color: var(--text); }
+
+  /* ---- layout ---- */
+  main { display: flex; flex: 1 1 auto; min-height: 0; }
+  aside {
+    width: 320px; flex: 0 0 320px; background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  .aside-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px; border-bottom: 1px solid var(--border); flex: 0 0 auto;
+  }
+  .aside-head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; margin: 0; color: var(--muted); }
+  .aside-head .spacer { flex: 1; }
+  .icon-btn { padding: 4px 8px; font-size: 13px; }
+  #session-list { overflow-y: auto; flex: 1 1 auto; }
+  .session {
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+    cursor: pointer; display: flex; gap: 10px; align-items: flex-start;
+  }
+  .session:hover { background: var(--panel-2); }
+  .session.active { background: var(--panel-2); box-shadow: inset 3px 0 0 var(--accent); }
+  .session .status-dot { margin-top: 6px; flex: 0 0 auto; }
+  .status-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .status-dot.live { background: var(--assistant); box-shadow: 0 0 6px var(--assistant); }
+  .status-dot.busy { background: var(--warn); box-shadow: 0 0 6px var(--warn); animation: pulse 1.2s infinite; }
+  .status-dot.dead { background: #5a6172; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .session .meta { min-width: 0; flex: 1; }
+  .session .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .session .sub { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* ---- conversation pane ---- */
+  section.pane { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .empty { margin: auto; text-align: center; color: var(--muted); }
+  .empty .big { font-size: 42px; margin-bottom: 8px; }
+
+  .pane-head {
+    padding: 12px 18px; border-bottom: 1px solid var(--border);
+    background: var(--panel); flex: 0 0 auto;
+  }
+  .pane-head .row1 { display: flex; align-items: center; gap: 10px; }
+  .pane-head .title { font-weight: 600; font-size: 15px; }
+  .pane-head .cwd { font-size: 12px; color: var(--muted); margin-top: 2px; word-break: break-all; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); }
+  .controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .controls label { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+  .controls .spacer { flex: 1; }
+
+  #log { flex: 1 1 auto; overflow-y: auto; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 82%; padding: 9px 13px; border-radius: 12px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: #1b2740; border: 1px solid #2a3d63; border-bottom-right-radius: 4px; }
+  .msg.assistant { align-self: flex-start; background: var(--panel-2); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+  .msg .who { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 3px; }
+  .msg.user .who { color: var(--user); }
+  .msg.assistant .who { color: var(--assistant); }
+  .tool { align-self: flex-start; font-family: var(--mono); font-size: 12px;
+    background: #201d16; border: 1px solid #3a3320; color: #d9c48a;
+    padding: 6px 10px; border-radius: 8px; max-width: 82%; }
+  .tool .name { color: var(--warn); font-weight: 600; }
+  .tool .args { color: #b9a06a; white-space: pre-wrap; word-break: break-all; }
+  .divider { align-self: center; font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+  .divider::before, .divider::after { content: ""; height: 1px; width: 40px; background: var(--border); }
+  .attention { align-self: center; color: #1a1206; background: var(--warn); font-weight: 600;
+    padding: 6px 12px; border-radius: 8px; font-size: 13px; }
+
+  .composer { flex: 0 0 auto; border-top: 1px solid var(--border); background: var(--panel);
+    padding: 12px 16px; display: flex; gap: 10px; align-items: flex-end; }
+  .composer textarea {
+    flex: 1; resize: none; font: inherit; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px; max-height: 180px; min-height: 42px;
+  }
+  .composer textarea:focus { outline: none; border-color: var(--accent-dim); }
+
+  #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    background: #2a1c1c; border: 1px solid var(--danger); color: #ffb3b6;
+    padding: 8px 14px; border-radius: 8px; font-size: 13px; opacity: 0;
+    transition: opacity .2s; pointer-events: none; max-width: 70%; z-index: 20; }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="logo">claude <span class="dot">●</span> remote control</span>
+    <span class="chip" id="whoami">…</span>
+    <span class="spacer"></span>
+    <span class="chip" id="stream-state"><span class="status-dot dead"></span> idle</span>
+  </header>
+
+  <main>
+    <aside>
+      <div class="aside-head">
+        <h2>Sessions</h2>
+        <span class="spacer"></span>
+        <button class="icon-btn" id="refresh-sessions" title="Refresh">⟳</button>
+      </div>
+      <div id="session-list"></div>
+    </aside>
+
+    <section class="pane" id="pane">
+      <div class="empty" id="empty">
+        <div class="big">🖥️</div>
+        <div>Select a session to watch and steer it.</div>
+        <div class="muted" style="margin-top:6px;font-size:12px">
+          Start one with <span class="mono">claude remote-control</span>
+        </div>
+      </div>
+
+      <div id="pane-body" style="display:none; flex:1; min-height:0; flex-direction:column;">
+        <div class="pane-head">
+          <div class="row1">
+            <span class="status-dot" id="s-dot"></span>
+            <span class="title" id="s-title">—</span>
+            <span class="badge" id="s-status"></span>
+            <span class="badge" id="s-model"></span>
+          </div>
+          <div class="cwd mono" id="s-cwd"></div>
+          <div class="controls">
+            <label>model
+              <select id="sel-model">
+                <option value="">— keep —</option>
+                <option>claude-opus-4-8</option>
+                <option>claude-sonnet-5</option>
+                <option>claude-haiku-4-5-20251001</option>
+                <option>claude-fable-5</option>
+              </select>
+            </label>
+            <label>permission
+              <select id="sel-perm">
+                <option value="">— keep —</option>
+                <option value="default">default</option>
+                <option value="plan">plan</option>
+                <option value="acceptEdits">acceptEdits</option>
+                <option value="bypassPermissions">bypassPermissions</option>
+              </select>
+            </label>
+            <button id="btn-interrupt" title="Interrupt the running turn">⛔ Interrupt</button>
+            <span class="spacer"></span>
+            <button id="btn-archive" class="danger" title="Archive this session">Archive</button>
+          </div>
+        </div>
+
+        <div id="log"></div>
+
+        <div class="composer">
+          <textarea id="composer-text" placeholder="Message this session…  (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+          <button class="primary" id="btn-send">Send</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const S = {
+  sessions: [], selectedId: null, session: null,
+  seen: new Set(), es: null, lastSeq: 0,
+};
+
+// ---- helpers -------------------------------------------------------------
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+  if (!res.ok) {
+    const msg = (data && (data.error || data.raw)) || res.statusText;
+    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+  }
+  return data;
+}
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.remove("show"), 4000);
+}
+function timeAgo(iso) {
+  if (!iso) return "";
+  const then = new Date(iso).getTime();
+  if (isNaN(then)) return "";
+  let s = Math.max(0, Math.floor((Date.now() - then) / 1000));
+  const u = [["d", 86400], ["h", 3600], ["m", 60]];
+  for (const [label, n] of u) if (s >= n) return `${Math.floor(s / n)}${label} ago`;
+  return `${s}s ago`;
+}
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function classifyStatus(s) {
+  const st = `${s.status || ""} ${s.worker_status || ""}`.toLowerCase();
+  if (/(running|busy|thinking|working|processing)/.test(st)) return "busy";
+  if (/(archiv|ended|terminat|disconnect|offline|dead|closed)/.test(st)) return "dead";
+  if (/(active|connect|idle|online|ready|live)/.test(st)) return "live";
+  return "dead";
+}
+
+// ---- whoami --------------------------------------------------------------
+async function loadWhoami() {
+  const w = $("whoami");
+  try {
+    const me = await api("/api/whoami");
+    if (!me.logged_in) { w.className = "chip bad"; w.textContent = "not logged in"; return; }
+    w.className = "chip";
+    const parts = [];
+    if (me.subscription) parts.push(me.subscription);
+    parts.push(me.org_uuid_present ? "org ✓" : "org ✗");
+    if (me.expired) parts.push("token expired");
+    w.textContent = parts.join(" · ");
+  } catch (e) { w.className = "chip bad"; w.textContent = "auth error"; }
+}
+
+// ---- sessions list -------------------------------------------------------
+async function loadSessions() {
+  let sessions;
+  try { sessions = (await api("/api/sessions")).sessions || []; }
+  catch (e) { toast("List failed: " + e.message); return; }
+  S.sessions = sessions;
+  renderSessions();
+}
+function renderSessions() {
+  const box = $("session-list");
+  box.innerHTML = "";
+  if (!S.sessions.length) {
+    box.appendChild(el("div", "muted", "  No sessions. Run `claude remote-control`.")).style.padding = "14px";
+    return;
+  }
+  for (const s of S.sessions) {
+    const row = el("div", "session" + (s.id === S.selectedId ? " active" : ""));
+    row.appendChild(el("span", "status-dot " + classifyStatus(s)));
+    const meta = el("div", "meta");
+    meta.appendChild(el("div", "title", s.title || "(untitled)"));
+    const model = (s.config && s.config.model) || "";
+    const sub = [s.status, model, timeAgo(s.last_event_at)].filter(Boolean).join(" · ");
+    meta.appendChild(el("div", "sub", sub || s.id));
+    row.appendChild(meta);
+    row.onclick = () => selectSession(s.id);
+    box.appendChild(row);
+  }
+}
+
+// ---- select + stream a session ------------------------------------------
+async function selectSession(id) {
+  if (S.es) { S.es.close(); S.es = null; }
+  S.selectedId = id; S.seen = new Set(); S.lastSeq = 0; S.session = null;
+  renderSessions();
+  $("empty").style.display = "none";
+  $("pane-body").style.display = "flex";
+  $("log").innerHTML = "";
+  $("s-title").textContent = "loading…";
+  $("s-status").textContent = ""; $("s-model").textContent = ""; $("s-cwd").textContent = "";
+  $("sel-model").value = ""; $("sel-perm").value = "";
+
+  try {
+    const s = await api(`/api/sessions/${id}`);
+    S.session = s; renderSessionHeader(s);
+  } catch (e) { toast("Load failed: " + e.message); }
+
+  try {
+    const { events } = await api(`/api/sessions/${id}/events?limit=200`);
+    for (const ev of events) appendEvent(ev, false);
+    scrollLog(true);
+  } catch (e) { toast("History failed: " + e.message); }
+
+  openStream(id);
+}
+function renderSessionHeader(s) {
+  $("s-title").textContent = s.title || "(untitled)";
+  $("s-status").textContent = [s.status, s.worker_status].filter(Boolean).join(" / ") || "—";
+  const model = (s.config && s.config.model) || "";
+  $("s-model").textContent = model || "model ?";
+  $("s-dot").className = "status-dot " + classifyStatus(s);
+  $("s-cwd").textContent = s.cwd || s.working_directory || (s.config && s.config.cwd) || "";
+  if (model) $("sel-model").value = [...$("sel-model").options].some(o => o.value === model) ? model : "";
+  const pm = (s.config && (s.config.permission_mode || s.config.permissionMode)) || "";
+  if (pm) $("sel-perm").value = pm;
+}
+function openStream(id) {
+  const es = new EventSource(`/api/sessions/${id}/stream?from_seq=${S.lastSeq}`);
+  S.es = es;
+  setStreamState("live", "streaming");
+  es.onmessage = (m) => {
+    if (id !== S.selectedId) return;
+    try { appendEvent(JSON.parse(m.data), true); } catch {}
+  };
+  es.addEventListener("error", (m) => {
+    if (m.data) { try { toast("Stream: " + JSON.parse(m.data).error); } catch {} }
+  });
+  es.onerror = () => { if (S.es === es) setStreamState("busy", "reconnecting…"); };
+  es.onopen = () => { if (S.es === es) setStreamState("live", "streaming"); };
+}
+function setStreamState(cls, label) {
+  $("stream-state").innerHTML = "";
+  $("stream-state").appendChild(el("span", "status-dot " + cls));
+  $("stream-state").appendChild(document.createTextNode(" " + label));
+}
+
+// ---- event rendering -----------------------------------------------------
+function appendEvent(ev, live) {
+  if (ev.sequence_num != null) {
+    if (S.seen.has(ev.sequence_num)) return;
+    S.seen.add(ev.sequence_num);
+    if (ev.sequence_num > S.lastSeq) S.lastSeq = ev.sequence_num;
+  }
+  const node = eventNode(ev);
+  if (!node) return;
+  const log = $("log");
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  log.appendChild(node);
+  if (live) scrollLog(atBottom);
+}
+function eventNode(ev) {
+  const frag = document.createDocumentFragment();
+  const text = (ev.text || "").trim();
+
+  if (ev.role === "user" && text) {
+    const m = el("div", "msg user");
+    m.appendChild(el("div", "who", "you"));
+    m.appendChild(el("div", null, text));
+    frag.appendChild(m);
+  } else if (ev.role === "assistant") {
+    if (text) {
+      const m = el("div", "msg assistant");
+      m.appendChild(el("div", "who", "claude"));
+      m.appendChild(el("div", null, text));
+      frag.appendChild(m);
+    }
+    for (const t of ev.tool_uses || []) {
+      const tool = el("div", "tool");
+      tool.appendChild(el("span", "name", "⚙ " + (t.name || "tool")));
+      const args = argPreview(t.input);
+      if (args) { tool.appendChild(document.createTextNode("  ")); tool.appendChild(el("span", "args", args)); }
+      frag.appendChild(tool);
+    }
+  } else if (ev.type === "system" && ev.subtype === "init") {
+    frag.appendChild(el("div", "divider", "session started" + (ev.model ? " · " + ev.model : "")));
+  } else if (ev.type === "result") {
+    frag.appendChild(el("div", "divider", "turn complete" + (ev.subtype && ev.subtype !== "success" ? " · " + ev.subtype : "")));
+  } else if (ev.is_blocking_control) {
+    frag.appendChild(el("div", "attention", "⚠ needs you: " + (ev.blocking_subtype || "input")));
+  } else {
+    return null;
+  }
+  return frag.childNodes.length ? frag : null;
+}
+function argPreview(input) {
+  if (input == null) return "";
+  let s;
+  if (typeof input === "string") s = input;
+  else {
+    const keys = ["command", "file_path", "path", "pattern", "query", "url", "description"];
+    const hit = keys.find(k => input[k]);
+    s = hit ? String(input[hit]) : JSON.stringify(input);
+  }
+  s = s.replace(/\s+/g, " ").trim();
+  return s.length > 160 ? s.slice(0, 160) + "…" : s;
+}
+function scrollLog(force) {
+  const log = $("log");
+  if (force) log.scrollTop = log.scrollHeight;
+}
+
+// ---- actions -------------------------------------------------------------
+async function post(path, body) {
+  return api(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+}
+async function sendMessage() {
+  const ta = $("composer-text");
+  const text = ta.value.trim();
+  if (!text || !S.selectedId) return;
+  ta.value = ""; autoGrow(ta);
+  try { await post(`/api/sessions/${S.selectedId}/send`, { text }); }
+  catch (e) { toast("Send failed: " + e.message); ta.value = text; }
+}
+async function steer(kind, path, body, okMsg) {
+  if (!S.selectedId) return;
+  try { await post(`/api/sessions/${S.selectedId}/${path}`, body); toast(okMsg); }
+  catch (e) { toast(kind + " failed: " + e.message); }
+}
+function autoGrow(ta) { ta.style.height = "42px"; ta.style.height = Math.min(180, ta.scrollHeight) + "px"; }
+
+// ---- wire up -------------------------------------------------------------
+$("refresh-sessions").onclick = loadSessions;
+$("btn-send").onclick = sendMessage;
+$("composer-text").addEventListener("input", (e) => autoGrow(e.target));
+$("composer-text").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+$("btn-interrupt").onclick = () => steer("Interrupt", "interrupt", {}, "Interrupt sent");
+$("btn-archive").onclick = async () => {
+  if (!S.selectedId || !confirm("Archive this session?")) return;
+  try {
+    await post(`/api/sessions/${S.selectedId}/archive`, {});
+    toast("Archived");
+    if (S.es) S.es.close();
+    S.selectedId = null; S.session = null;
+    $("pane-body").style.display = "none"; $("empty").style.display = "block";
+    setStreamState("dead", "idle");
+    loadSessions();
+  } catch (e) { toast("Archive failed: " + e.message); }
+};
+$("sel-model").onchange = (e) => {
+  const model = e.target.value;
+  if (model) steer("Set model", "model", { model }, "Model → " + model);
+};
+$("sel-perm").onchange = (e) => {
+  const mode = e.target.value;
+  if (mode) steer("Set permission", "permission_mode", { mode }, "Permission → " + mode);
+};
+
+// ---- boot ----------------------------------------------------------------
+loadWhoami();
+loadSessions();
+setInterval(loadSessions, 6000);
+setInterval(() => { if (S.selectedId) { /* keep list times fresh */ renderSessions(); } }, 30000);
+</script>
+</body>
+</html>
