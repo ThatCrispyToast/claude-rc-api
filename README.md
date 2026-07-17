@@ -1,25 +1,26 @@
 # claude-rc-api
 
-Unofficial Python client for the **Claude Code Remote Control** web service —
+Unofficial Python client for the Claude Code Remote Control web service,
 reverse-engineered from the Claude Code CLI and exercised against the live API.
 
 It lets your own programs do what `claude.ai/code` and the Claude mobile app do:
-**list, observe, and steer Claude Code sessions running on a machine** — using the
-same `/v1/code/sessions` endpoints and claude.ai OAuth token the web app uses.
+list, observe, and steer Claude Code sessions running on a machine. It talks to
+the same `/v1/code/sessions` endpoints and claude.ai OAuth token the web app
+uses.
 
-> ⚠️ **Unofficial & unsupported.** These are private endpoints (`api.anthropic.com`),
-> reconstructed from the CLI binary. They can change or break at any time. Use with
-> your own account, at your own risk. Full protocol writeup in
-> [`API_REFERENCE.md`](./API_REFERENCE.md).
+> ⚠️ **Unofficial and unsupported.** These are private endpoints
+> (`api.anthropic.com`), reconstructed from the CLI binary. They can change or
+> break at any time. Use your own account, at your own risk. Full protocol
+> writeup in [`API_REFERENCE.md`](./API_REFERENCE.md).
 
 ---
 
 ## How it works
 
-Remote Control is a **relay**, not cloud compute: your local `claude remote-control`
-process runs Claude and keeps an outbound connection to Anthropic; the web/app is a
-**controller** that posts messages and reads the session's event stream. This library
-plays that controller role.
+Remote Control relays, it doesn't run cloud compute. Your local
+`claude remote-control` process runs Claude and holds an outbound connection to
+Anthropic; the web app and mobile app act as a controller that posts messages
+and reads the session's event stream. This library plays that controller role.
 
 ```
 your script ──► POST /v1/code/sessions/{id}/events    (send a message)
@@ -27,7 +28,7 @@ your script ──► POST /v1/code/sessions/{id}/events    (send a message)
    (claude.ai OAuth Bearer + x-organization-uuid, from ~/.claude)
 ```
 
-It also ships a `ManagedAgentsClient` for the sibling **public** Sessions API
+It also ships a `ManagedAgentsClient` for the sibling public Sessions API
 (`/v1/sessions`, `x-api-key`) that runs agents in Anthropic's cloud.
 
 ## Install
@@ -40,7 +41,7 @@ pip install "git+https://github.com/ThatCrispyToast/claude-rc-api"              
 uvx --from "git+https://github.com/ThatCrispyToast/claude-rc-api[cli]" claude-rc list   # run the CLI, zero install
 ```
 
-For development in a checkout, [uv](https://docs.astral.sh/uv/) is recommended:
+For development in a checkout, use [uv](https://docs.astral.sh/uv/):
 
 ```bash
 uv sync --extra cli                 # runtime + pretty CLI
@@ -51,12 +52,13 @@ uv sync --extra cli --extra test    # + pytest
 
 1. Log in to Claude Code with a claude.ai account (Pro/Max/Team/Enterprise):
    `claude` → `/login`. (API-key logins can't use Remote Control.)
-2. Have a session to drive: run `claude remote-control` (or `claude --remote-control`)
-   in some project — it registers a session you can then control from here.
+2. Have a session to drive: run `claude remote-control` (or
+   `claude --remote-control`) in some project. That registers a session you can
+   then control from here.
 
-Credentials are read automatically from `~/.claude/.credentials.json` (OAuth token)
-and `~/.claude.json` (`organizationUuid`). Override with `CLAUDE_RC_ACCESS_TOKEN` /
-`CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_RC_ORG_UUID`.
+Credentials load automatically from `~/.claude/.credentials.json` (OAuth token)
+and `~/.claude.json` (`organizationUuid`). Override them with
+`CLAUDE_RC_ACCESS_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_RC_ORG_UUID`.
 
 ## CLI
 
@@ -73,9 +75,9 @@ claude-rc web                    # browser control panel (all sessions)
 
 ## Web UI
 
-A dependency-free browser control panel for your Remote Control sessions —
-list them, watch the live event stream, send messages, and steer (interrupt /
-set model / set permission mode / archive):
+A dependency-free browser control panel for your Remote Control sessions: list
+them, watch the live event stream, send messages, and steer (interrupt / set
+model / set permission mode / archive).
 
 ```bash
 claude-rc web                    # serves http://127.0.0.1:8765 and opens it
@@ -83,10 +85,10 @@ claude-rc web --port 9000 --no-open
 ```
 
 It's a standard-library `http.server` (no new dependencies) that proxies the
-`RemoteControlClient`. Because it speaks to the private API with *your* OAuth
-token and does no auth of its own, it binds to `127.0.0.1` by default — only
-pass `--host 0.0.0.0` if you understand that anyone who can reach it can steer
-your sessions. Also available programmatically:
+`RemoteControlClient`. It speaks to the private API with *your* OAuth token and
+does no auth of its own, so it binds to `127.0.0.1` by default. Pass
+`--host 0.0.0.0` only if you accept that anyone who can reach it can steer your
+sessions. You can also run it programmatically:
 
 ```python
 from claude_rc import serve_webui
@@ -161,10 +163,11 @@ ev.is_blocking_control  # a permission prompt waiting on you
 ## Safety
 
 - `list`/`get`/`events`/`watch` and all `RemoteControlClient` read methods are
-  **read-only**. `send`/`repl`/`send_message`/`interrupt` **inject into a live
-  session** — only use them on sessions you own.
-- Token refresh writes the refreshed token back to `~/.claude/.credentials.json`
-  (same as the CLI). Pass `persist_refresh=False` to keep refreshes in-memory.
+  read-only. `send`/`repl`/`send_message`/`interrupt` inject into a live
+  session, so only use them on sessions you own.
+- Token refresh writes the refreshed token back to
+  `~/.claude/.credentials.json` (same as the CLI). Pass `persist_refresh=False`
+  to keep refreshes in memory.
 - This project never prints or transmits your tokens.
 
 ## Project layout
@@ -189,4 +192,4 @@ tests/             # offline unit tests (pytest)
 uv run --extra test pytest -q
 ```
 
-All tests are offline (no network, no credentials required).
+All tests run offline (no network, no credentials required).
