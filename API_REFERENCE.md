@@ -199,8 +199,25 @@ attachments.
 | `set_model` (`model`) | change model mid-session |
 | `set_permission_mode` (`mode`, opt `ultraplan`) | `default` \| `plan` \| `acceptEdits` \| `bypassPermissions` |
 | `set_max_thinking_tokens` | thinking budget |
+| `apply_flag_settings` (`settings`) | merge session flag settings — notably `settings.effortLevel` (`low` \| `medium` \| `high` \| `xhigh`, explicit `null` = back to auto) + `settings.ultracode` (bool). This is how the CLI's `/effort` reaches an SDK/cloud worker (there is **no** `set_effort` subtype; `max` is session-scoped and rejected by the worker's schema). ⚠️ **Remote-control REPL workers do NOT dispatch this subtype** (confirmed live on 2.1.187; the dispatch table is unchanged in 2.1.212) — they answer `control_response {subtype:"error", error:"REPL bridge does not handle control_request subtype: apply_flag_settings"}`. `RemoteControlClient.set_effort()` wraps it, with an optional wait-for-verdict + `/effort` slash-command fallback. |
 | `can_use_tool` | answer a permission prompt |
-| `apply_flag_settings`, `mcp_message`, `request_user_dialog`, `seed_read_state`, `set_mcp_permission_mode_override` | other controls |
+| `mcp_message`, `request_user_dialog`, `seed_read_state`, `set_mcp_permission_mode_override` | other controls |
+
+The remote-control REPL worker's full `control_request` dispatch table (2.1.187 and
+2.1.212, from the binary): `initialize`, `set_model`, `set_max_thinking_tokens`,
+`set_permission_mode`, `rename_session`, `set_color`, `file_suggestions`,
+`read_file`, `get_context_usage`, `get_usage`, `mcp_status`, `mcp_authenticate`,
+`mcp_oauth_callback_url`, `mcp_reconnect`, `interrupt` — anything else gets the
+"does not handle" error response.
+
+**Slash commands work as user messages** (confirmed live, 2026-07-17): a `user`
+event whose text is e.g. `/effort high` is executed by the remote-control worker
+as a **local command** — zero cost, `num_turns: 0`, no API call; the transcript
+gains the synthetic `<command-name>` user events plus a synthetic assistant echo
+of the command output (e.g. "Set effort level to high (saved as your default for
+new sessions)"). Semantics are exactly "typed at that terminal" — so `/effort
+<level>` **persists that machine's default**, it is not session-scoped. This is
+the practical route for any steering the control table above lacks.
 
 ### 3.3 Receiving events
 

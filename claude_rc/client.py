@@ -48,7 +48,7 @@ MANAGED_AGENTS_BETA = "managed-agents-2026-04-01"
 ANTHROPIC_VERSION = "2023-06-01"
 # anthropic-client-platform value the web/mobile Remote Control clients use.
 CLIENT_PLATFORM = "claude_code_remote"
-USER_AGENT = "claude-rc-api-python/0.1.0"
+USER_AGENT = "claude-rc-api-python/0.2.0"
 
 
 def _backoff_sleep(attempt: int, base: float = 0.5, cap: float = 30.0) -> None:
@@ -61,6 +61,16 @@ class APIError(RuntimeError):
         self.body = body
         self.request_id = request_id
         super().__init__(f"HTTP {status}{f' [{request_id}]' if request_id else ''}: {body[:300]}")
+
+
+class ControlRejected(RuntimeError):
+    """The worker answered a ``control_request`` with an error ``control_response``.
+
+    The ingest POST succeeding only means the request was queued — the worker
+    acks (or refuses) asynchronously in the event stream. E.g. remote-control
+    REPL workers (observed through Claude Code 2.1.212) do not dispatch the
+    ``apply_flag_settings`` subtype and answer
+    ``"REPL bridge does not handle control_request subtype: …"``."""
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +285,91 @@ class RemoteControlClient:
             "set_permission_mode", request_id=f"set-mode-{uuid.uuid4()}", mode=mode
         )
         return self.send_events(session_id, [req])
+
+    def set_effort(
+        self,
+        session_id: str,
+        effort: str | None,
+        *,
+        ultracode: bool = False,
+        wait: float | None = None,
+        command_fallback: bool = False,
+    ) -> dict:
+        """Set reasoning effort: ``low`` | ``medium`` | ``high`` | ``xhigh``; ``None`` = auto.
+
+        There is no ``set_effort`` control subtype — the CLI's ``/effort`` command
+        sends ``apply_flag_settings`` with ``settings.effortLevel`` (an explicit
+        ``null`` clears back to auto) and ``ultracode`` alongside it (a plain
+        effort change switches ultracode off). ``max`` is session-scoped in the
+        CLI and rejected by the worker's flag-settings schema, so it cannot be
+        applied remotely. ``ultracode=True`` needs ``effort="xhigh"`` and an
+        xhigh-capable model on the worker.
+
+        **Remote-control REPL workers (observed through 2.1.212) do not dispatch
+        ``apply_flag_settings``** — they refuse it with an error
+        ``control_response`` (SDK/cloud workers apply it). Hence the two opt-ins:
+
+        * ``wait`` (seconds) — poll for the worker's ``control_response`` and act
+          on the verdict instead of firing blind. Without it, a refusal only ever
+          surfaces in the event stream.
+        * ``command_fallback`` — on refusal, inject ``/effort <level>`` as a user
+          message instead. Remote-control workers execute slash commands from
+          controllers as local commands (verified live: zero cost, no model
+          turn) — but mind the CLI semantics: a plain level is also *persisted
+          as that machine's default for new sessions*, not session-scoped.
+          Requires ``wait``. Without it a refusal raises :class:`ControlRejected`.
+
+        Returns ``{"via": "control" | "command" | "control_unconfirmed", "ack": …}``
+        — ``control_unconfirmed`` means ``wait`` elapsed with no verdict (assumed
+        applied; no fallback is attempted, to avoid a double apply).
+        """
+        request_id = f"set-effort-{uuid.uuid4()}"
+        req = cli_control_request(
+            "apply_flag_settings",
+            request_id=request_id,
+            settings={"effortLevel": effort, "ultracode": ultracode},
+        )
+        ack = self.send_events(session_id, [req])
+        if wait is None:
+            return {"via": "control", "ack": ack}
+        resp = self.wait_control_response(session_id, request_id, timeout=wait)
+        if resp is None:
+            return {"via": "control_unconfirmed", "ack": ack}
+        if resp.get("subtype") != "error":
+            return {"via": "control", "ack": ack}
+        if not command_fallback:
+            raise ControlRejected(str(resp.get("error") or "control request rejected"))
+        command = "ultracode" if ultracode else (effort or "auto")
+        ack = self.send_message(session_id, f"/effort {command}")
+        return {"via": "command", "ack": ack}
+
+    def wait_control_response(
+        self,
+        session_id: str,
+        request_id: str,
+        *,
+        timeout: float = 5.0,
+        poll_interval: float = 0.4,
+    ) -> dict | None:
+        """Poll history for the worker's ``control_response`` to ``request_id``.
+
+        Returns the ``response`` object (``subtype`` is ``success`` | ``error``),
+        or ``None`` if none arrived within ``timeout``. Controls are acked
+        asynchronously through the event stream — a 200 on the ingest POST only
+        means "queued", so this is how a caller learns whether the worker
+        actually applied one.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            for ev in self.list_events(session_id, limit=25, sort_order="desc"):
+                if ev.type != "control_response":
+                    continue
+                resp = ev.payload.get("response") or {}
+                if resp.get("request_id") == request_id:
+                    return resp
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(poll_interval)
 
     def mark_read(self, session_id: str, up_to_sequence_num: int | None = None) -> Any:
         """``POST /v1/code/sessions/{id}/mark_read`` — mark the session read."""

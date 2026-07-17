@@ -121,6 +121,7 @@ for ev in rc.stream_events(sid):
 rc.interrupt(sid)
 rc.set_model(sid, "claude-opus-4-8")
 rc.set_permission_mode(sid, "acceptEdits")
+rc.set_effort(sid, "high")  # low|medium|high|xhigh, or None = auto
 ```
 
 Cloud (Managed Agents) mode:

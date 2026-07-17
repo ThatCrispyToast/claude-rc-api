@@ -97,6 +97,85 @@ def test_cli_control_request_shape():
     assert r["request"] == {"subtype": "set_model", "model": "claude-opus-4-8"}
 
 
+def test_cli_control_request_effort_shape():
+    # Effort rides apply_flag_settings (there is no set_effort subtype); an
+    # explicit null effortLevel means "clear back to auto", so it must survive.
+    r = cli_control_request(
+        "apply_flag_settings", "rid-2", settings={"effortLevel": None, "ultracode": False}
+    )
+    assert r["request"] == {
+        "subtype": "apply_flag_settings",
+        "settings": {"effortLevel": None, "ultracode": False},
+    }
+
+
+# --- set_effort verdict handling (offline: transport methods stubbed) -------
+def _bare_rc() -> "RemoteControlClient":
+    from claude_rc.client import RemoteControlClient
+
+    return RemoteControlClient.__new__(RemoteControlClient)  # skip __init__ / creds
+
+
+def test_set_effort_control_accepted(monkeypatch):
+    rc = _bare_rc()
+    sent = []
+    monkeypatch.setattr(rc, "send_events", lambda sid, evs: sent.append(list(evs)) or {"ok": 1})
+    monkeypatch.setattr(
+        rc, "wait_control_response", lambda sid, rid, timeout: {"subtype": "success", "request_id": rid}
+    )
+    out = rc.set_effort("cse_x", "high", wait=1.0, command_fallback=True)
+    assert out["via"] == "control"
+    assert sent[0][0]["request"]["settings"] == {"effortLevel": "high", "ultracode": False}
+
+
+def test_set_effort_command_fallback(monkeypatch):
+    # Remote-control REPL workers refuse apply_flag_settings — the fallback
+    # injects the /effort slash command (which they execute as a local command).
+    rc = _bare_rc()
+    messages = []
+    monkeypatch.setattr(rc, "send_events", lambda sid, evs: {})
+    monkeypatch.setattr(
+        rc,
+        "wait_control_response",
+        lambda sid, rid, timeout: {
+            "subtype": "error",
+            "error": "REPL bridge does not handle control_request subtype: apply_flag_settings",
+            "request_id": rid,
+        },
+    )
+    monkeypatch.setattr(rc, "send_message", lambda sid, text: messages.append(text) or {})
+    assert rc.set_effort("cse_x", "high", wait=1.0, command_fallback=True)["via"] == "command"
+    assert messages == ["/effort high"]
+    assert rc.set_effort("cse_x", None, wait=1.0, command_fallback=True)["via"] == "command"
+    assert messages[-1] == "/effort auto"
+
+
+def test_set_effort_rejected_without_fallback(monkeypatch):
+    from claude_rc.client import ControlRejected
+
+    rc = _bare_rc()
+    monkeypatch.setattr(rc, "send_events", lambda sid, evs: {})
+    monkeypatch.setattr(
+        rc, "wait_control_response", lambda sid, rid, timeout: {"subtype": "error", "error": "nope"}
+    )
+    try:
+        rc.set_effort("cse_x", "low", wait=1.0)
+        raise AssertionError("expected ControlRejected")
+    except ControlRejected as exc:
+        assert "nope" in str(exc)
+
+
+def test_set_effort_timeout_no_fallback(monkeypatch):
+    # No verdict within `wait` → assume applied, do NOT double-apply via command.
+    rc = _bare_rc()
+    messages = []
+    monkeypatch.setattr(rc, "send_events", lambda sid, evs: {})
+    monkeypatch.setattr(rc, "wait_control_response", lambda sid, rid, timeout: None)
+    monkeypatch.setattr(rc, "send_message", lambda sid, text: messages.append(text) or {})
+    assert rc.set_effort("cse_x", "high", wait=0.1, command_fallback=True)["via"] == "control_unconfirmed"
+    assert messages == []
+
+
 def test_managed_agents_user_message_shape():
     assert user_message("x") == {"type": "user.message", "content": [{"type": "text", "text": "x"}]}
 
