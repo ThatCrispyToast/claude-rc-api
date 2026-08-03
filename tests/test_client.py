@@ -180,6 +180,49 @@ def test_managed_agents_user_message_shape():
     assert user_message("x") == {"type": "user.message", "content": [{"type": "text", "text": "x"}]}
 
 
+def test_managed_agents_stream_raises_apierror_on_non_200(monkeypatch):
+    """A failed stream must surface as APIError.
+
+    The body has to be read before it is formatted: httpx raises
+    ``ResponseNotRead`` if ``.text`` is touched on a still-streaming response,
+    which would mask the real status behind an unrelated exception.
+    """
+    from claude_rc.client import APIError, ManagedAgentsClient
+
+    class _Resp:
+        status_code = 503
+        headers = {"request-id": "req_1"}
+        read_called = False
+
+        def read(self):
+            type(self).read_called = True
+            return b"upstream unavailable"
+
+        @property
+        def text(self):
+            raise AssertionError("must not read .text of an unread stream")
+
+        def iter_lines(self):
+            raise AssertionError("must not parse the body of an error response")
+
+    class _Stream:
+        def __enter__(self):
+            return _Resp()
+
+        def __exit__(self, *exc):
+            return False
+
+    ma = ManagedAgentsClient(api_key="k")
+    monkeypatch.setattr(ma._http, "stream", lambda *a, **kw: _Stream())
+    with pytest.raises(APIError) as excinfo:
+        list(ma.stream_events("sesn_1"))
+    assert excinfo.value.status == 503
+    assert excinfo.value.request_id == "req_1"
+    assert "upstream unavailable" in excinfo.value.body
+    assert _Resp.read_called
+    ma.close()
+
+
 # --- credentials -----------------------------------------------------------
 def test_load_credentials_from_file(tmp_path: Path):
     p = tmp_path / ".credentials.json"

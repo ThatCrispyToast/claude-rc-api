@@ -630,7 +630,12 @@ class ManagedAgentsClient:
             params=params,
             timeout=httpx.Timeout(30.0, read=None),
         ) as resp:
-            self._ok(resp) if resp.status_code != 200 else None
+            if resp.status_code != 200:
+                # Read the body first: on a streaming response `_ok` would touch
+                # `.text` before it exists and raise httpx.ResponseNotRead
+                # instead of the APIError callers are told to expect.
+                body = resp.read().decode(errors="replace")
+                raise APIError(resp.status_code, body, resp.headers.get("request-id"))
             for frame in parse_sse(resp.iter_lines()):
                 if frame.is_heartbeat:
                     continue
