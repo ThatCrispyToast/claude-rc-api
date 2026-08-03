@@ -16,8 +16,9 @@ def main() -> None:
     session_id, message = sys.argv[1], sys.argv[2]
 
     with RemoteControlClient() as rc:
-        # send_and_collect opens the stream first, sends, and returns every
-        # event until the turn completes (a `result` event) or blocks on you.
+        # send_and_collect sends, then streams from the sequence number that was
+        # current beforehand (so nothing is missed), and returns every event
+        # until the turn completes (a `result` event) or blocks on you.
         for ev in rc.send_and_collect(session_id, message):
             if ev.role == "assistant" and ev.text().strip():
                 print("claude>", ev.text().strip())

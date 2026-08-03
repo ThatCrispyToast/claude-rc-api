@@ -503,7 +503,13 @@ class RemoteControlClient:
         """Send a message and stream until the session goes idle again.
 
         Returns every event received during the turn. This is the "ask and wait
-        for the answer" pattern. Opens the stream first, then sends.
+        for the answer" pattern.
+
+        Nothing is lost to the gap between sending and connecting. :meth:`stream_events`
+        is a generator, so the HTTP connection only opens on the first iteration
+        below — *after* the send — but the stream is resumed from the newest
+        sequence number that existed beforehand, so the server replays anything
+        that happened in between.
         """
         # Seed the resume cursor from the newest event so we only see new ones.
         try:

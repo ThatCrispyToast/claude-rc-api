@@ -392,7 +392,7 @@ from claude_rc import RemoteControlClient
 rc = RemoteControlClient()                       # reads ~/.claude credentials
 sid = rc.sessions()[0]["id"]                     # a live `claude remote-control` session
 
-# ask + wait for the answer (opens the stream first, then sends, stops on `result`)
+# ask + wait for the answer (sends, then streams from the pre-send cursor, stops on `result`)
 for ev in rc.send_and_collect(sid, "summarize the diff", print_stream=True):
     pass
 
@@ -402,6 +402,9 @@ for ev in rc.stream_events(sid):
         print(ev.text())
 ```
 
-**Ordering rule (both modes):** open the stream *before* sending, or early events
-arrive as one buffered batch. User events queue server-side and process in order;
-`interrupt` jumps the queue.
+**Ordering rule:** pin the resume point *before* you send. Mode A is server-side
+resumable, so connecting late with `from_sequence_num=<pre-send>` replays the gap
+as one buffered batch rather than losing it (this is exactly what
+`send_and_collect` does). Mode B has **no replay** (§4.3) — open the stream first
+and reconcile against `GET …/events`, de-duping by event `id`. In both modes user
+events queue server-side and process in order; `interrupt` jumps the queue.

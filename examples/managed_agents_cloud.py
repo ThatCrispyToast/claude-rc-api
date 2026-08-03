@@ -34,7 +34,11 @@ def main() -> None:
         sid = session["id"]
         print("session:", sid)
 
-        # 4. Stream first, then send (the stream only delivers events after it opens).
+        # 4. Send, then stream. `stream_events` is a generator, so the connection
+        #    opens on the first iteration below, not here — and mode B has no SSE
+        #    replay, so a very early event can be missed. A production client
+        #    reconciles with `list_events` and de-dupes by event id
+        #    (API_REFERENCE.md §4.3); this example keeps it short.
         ma.send_message(sid, "In one sentence, what is a monad?")
         for ev in ma.stream_events(sid):
             if ev.type == "agent.message":

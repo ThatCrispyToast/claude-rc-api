@@ -108,7 +108,7 @@ for s in rc.sessions():
 
 sid = rc.sessions()[0]["id"]
 
-# ask and wait for the answer (opens the stream first, sends, stops on the `result` event)
+# ask and wait for the answer (sends, streams from the pre-send cursor, stops on `result`)
 for ev in rc.send_and_collect(sid, "summarize the current diff", print_stream=True):
     pass
 
