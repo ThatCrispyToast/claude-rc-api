@@ -170,6 +170,14 @@ ev.is_blocking_control  # a permission prompt waiting on you
   to keep refreshes in memory.
 - This project never prints or transmits your tokens.
 
+## Used by
+
+[`claude-remote-bridge`](https://github.com/ThatCrispyToast/g2-claude-remote)
+(the `server/` half of the Claude Remote glasses app) depends on this package
+straight from git and wraps `RemoteControlClient` in a JSON + SSE HTTP bridge. It
+imports `client`, `credentials`, and `events`, and resolves this repo's default
+branch on each fresh `uv` install — so keep those three backwards-compatible.
+
 ## Project layout
 
 ```
