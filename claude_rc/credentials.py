@@ -7,12 +7,13 @@ in ``~/.claude.json``.
 
 This module reads those files so a third-party program can authenticate exactly
 the way the claude.ai/code web app does, and refreshes the access token against
-``POST https://api.anthropic.com/v1/oauth/token`` when it has expired.
+``POST https://platform.claude.com/v1/oauth/token`` when it has expired.
 
 All of the constants below were reverse-engineered from the CLI binary:
 
 * client id          -> ``9d1c250a-e61b-44d9-88ed-5944d1962f5e``
-* token endpoint     -> ``https://api.anthropic.com/v1/oauth/token``
+* token endpoint     -> ``https://platform.claude.com/v1/oauth/token``
+  (refresh is served by platform.claude.com, *not* api.anthropic.com)
 * oauth beta header  -> ``oauth-2025-04-20``
 """
 
@@ -180,7 +181,7 @@ def refresh_credentials(
 ) -> OAuthCredentials:
     """Refresh an expired access token via the OAuth token endpoint.
 
-    Mirrors the CLI: ``POST /v1/oauth/token`` with a JSON body of
+    Mirrors the CLI: ``POST`` to :data:`OAUTH_TOKEN_URL` with a JSON body of
     ``{grant_type, refresh_token, client_id}`` and the ``oauth-2025-04-20`` beta
     header. On success the new tokens are (optionally) written back to the same
     credentials file so subsequent runs stay authenticated.
