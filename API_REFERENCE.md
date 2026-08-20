@@ -69,7 +69,7 @@ The scope that gates Remote Control is **`user:sessions:claude_code`**.
 Authorization:              Bearer <accessToken>
 Content-Type:               application/json
 anthropic-version:          2023-06-01                 # the ONLY version string ever sent
-anthropic-client-platform:  claude_code_remote         # XR(); web/mobile value
+anthropic-client-platform:  web_claude_ai              # LOAD-BEARING on event ingest — see §2.3
 x-organization-uuid:        <organizationUuid>
 anthropic-beta:             ccr-byoc-2025-07-29         # on /v1/sessions (v1) & /v1/code/* ; NOT on the bare /v1/code/sessions list
 X-Trusted-Device-Token:     <token>                    # only if org requires Trusted Devices
@@ -107,9 +107,22 @@ Content-Type:      application/json
 | `files-api-2025-04-14` | `/v1/files` (both modes) |
 | `oidc-federation-2026-04-01` | enterprise WIF/OIDC token exchange |
 
-`anthropic-client-platform` (`XR()`) enum by `CLAUDE_CODE_ENTRYPOINT`:
-`claude_code_remote` (web/mobile/desktop remote), `claude_code_vscode`,
-`claude_code_sdk`, `claude_code_mcp`, `claude_code_github_action`, ….
+`anthropic-client-platform` — **since Claude Code ~2.1.220 this header decides
+whether a sent message is treated as human.** CCR ingress stamps the header
+value into each ingested event as `client_platform` (the event schema marks it
+"Injected server-side by CCR ingress from the request header"; the sibling
+`inbound_origin` is likewise server-asserted and not client-settable). The
+worker classifies a user message as a *human controller* message only when the
+stamped value is one of `ios`, `android`, `web_claude_ai`, `desktop_app`
+(exact set from the 2.1.234 binary). Any other value — including
+`claude_code_remote`, the CLI's own `CLAUDE_CODE_ENTRYPOINT` telemetry enum
+(`claude_code_cli`, `claude_code_vscode`, `claude_code_sdk`, …) that this
+library sent before 0.2.1 — demotes the message to **peer origin**: the worker
+logs `[bridge] demoting unwrapped inbound message to peer origin`, frames it as
+"Another Claude session sent a message" with `isMeta`, and its peer gate may
+park it without ever starting a turn (the "message appears but Claude never
+responds" failure on ≥2.1.220 workers; 2.1.219 predates the gate and ran every
+inbound message). Send `web_claude_ai`.
 
 ---
 

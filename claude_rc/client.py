@@ -46,9 +46,17 @@ DEFAULT_BASE_URL = "https://api.anthropic.com"
 CCR_BETA = "ccr-byoc-2025-07-29"          # /v1/sessions (v1) remote-control path
 MANAGED_AGENTS_BETA = "managed-agents-2026-04-01"
 ANTHROPIC_VERSION = "2023-06-01"
-# anthropic-client-platform value the web/mobile Remote Control clients use.
-CLIENT_PLATFORM = "claude_code_remote"
-USER_AGENT = "claude-rc-api-python/0.2.0"
+# anthropic-client-platform value the claude.ai web app sends. Since Claude Code
+# ~2.1.220 this header is load-bearing on ingest, not telemetry: CCR ingress
+# stamps it into each ingested event's `client_platform`, and the worker treats
+# a user message as coming from a *human controller* only when that value is
+# one of `ios` / `android` / `web_claude_ai` / `desktop_app`. Any other value
+# (including the `claude_code_remote` this library sent before 0.2.1) gets the
+# message demoted to *peer* origin — "Another Claude session sent a message"
+# framing — and, depending on the worker's peer-gate policy, parked without
+# ever starting a turn (observed live on 2.1.234; 2.1.219 predates the gate).
+CLIENT_PLATFORM = "web_claude_ai"
+USER_AGENT = "claude-rc-api-python/0.2.1"
 
 
 def _backoff_sleep(attempt: int, base: float = 0.5, cap: float = 30.0) -> None:

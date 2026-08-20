@@ -1,6 +1,6 @@
 [project]
 name = "claude-rc-api"
-version = "0.2.0"
+version = "0.2.1"
 description = "Unofficial Python client for the Claude Code Remote Control / Sessions API (reverse-engineered)"
 readme = "README.md"
 requires-python = ">=3.10"
