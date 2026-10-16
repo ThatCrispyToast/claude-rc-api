@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +40,27 @@ OAUTH_USER_AGENT = "anthropic-sdk-typescript/0.94.0 userOAuthProvider"
 
 DEFAULT_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 DEFAULT_CONFIG_PATH = Path.home() / ".claude.json"
+
+# macOS: Claude Code keeps the login in the Keychain ("Claude Code-credentials"),
+# not in ~/.claude/.credentials.json. When the file is missing we read the
+# Keychain on every load and NEVER refresh the token ourselves: refresh tokens
+# are single-use, and spending one would sign the official app/CLI out.
+# Renewal stays with Claude Code; we just pick up whatever it last wrote.
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+KEYCHAIN_SOURCE = Path("<macos-keychain>")
+
+
+def _read_keychain() -> Optional[dict]:
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run(
+            ["/usr/bin/security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.strip()
+        return json.loads(out)
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        return None
 
 # Environment overrides (handy in CI / other machines).
 ENV_ACCESS_TOKEN = "CLAUDE_RC_ACCESS_TOKEN"
@@ -120,6 +143,16 @@ def load_credentials(path: os.PathLike | str | None = None) -> OAuthCredentials:
         return OAuthCredentials(access_token=env_token)
 
     p = Path(path) if path else DEFAULT_CREDENTIALS_PATH
+    if not p.exists() and path is None:
+        data = _read_keychain()
+        if data and data.get("claudeAiOauth"):
+            creds = OAuthCredentials.from_block(
+                data["claudeAiOauth"],
+                source_path=KEYCHAIN_SOURCE,
+                trusted_device_token=data.get("trustedDeviceToken"),
+            )
+            creds.refresh_token = None  # read-only: never spend Claude Code's refresh token
+            return creds
     if not p.exists():
         raise CredentialsError(
             f"credentials file not found at {p}. Run `claude` and `/login` first, "
@@ -240,7 +273,7 @@ def refresh_credentials(
 def _persist(creds: OAuthCredentials) -> None:
     """Atomically write refreshed tokens back, preserving other keys."""
     path = creds.source_path
-    if not path:
+    if not path or path == KEYCHAIN_SOURCE:
         return
     try:
         data = json.loads(path.read_text()) if path.exists() else {}
