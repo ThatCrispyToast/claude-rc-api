@@ -63,6 +63,11 @@ turn or adding to the transcript (it costs a model call).
 
 ## Web UI
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/webui-dark.png">
+  <img alt="The web UI: a sidebar of sessions beside one session's transcript, which ends in a Bash permission prompt with Allow and Deny buttons" src="docs/webui-light.png">
+</picture>
+
 A dependency-free browser control panel for your Remote Control sessions:
 
 - **Sessions**: pins first, each with its effort, context use and status
@@ -313,6 +318,7 @@ claude_rc/
   webui.py         # `claude-rc web`, the stdlib http.server control panel
   static/          # the web UI single-page app
 API_REFERENCE.md   # full reverse-engineered protocol reference
+docs/              # web UI screenshots, from made-up sessions by screenshot.py
 examples/          # runnable examples
 tests/             # offline unit tests (pytest)
 ```
