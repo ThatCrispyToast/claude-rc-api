@@ -25,6 +25,7 @@ from .client import (
     RemoteControlClient,
     CCR_BETA,
     MANAGED_AGENTS_BETA,
+    PINNED_TAG,
 )
 from .credentials import (
     CredentialsError,
@@ -61,6 +62,7 @@ __all__ = [
     "APIError",
     "ControlRejected",
     "ControlTimeout",
+    "PINNED_TAG",
     "OAuthCredentials",
     "CredentialsError",
     "enroll_trusted_device",

@@ -79,6 +79,7 @@
   }
   .aside-head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; margin: 0; color: var(--muted); }
   .aside-head .spacer { flex: 1; }
+  .aside-head label { font-size: 12px; display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
   .icon-btn { padding: 4px 8px; font-size: 13px; }
   #session-list { overflow-y: auto; flex: 1 1 auto; }
   .session {
@@ -165,6 +166,7 @@
       <div class="aside-head">
         <h2>Sessions</h2>
         <span class="spacer"></span>
+        <label class="muted" title="Include archived sessions"><input type="checkbox" id="show-archived" /> archived</label>
         <button class="icon-btn" id="refresh-sessions" title="Refresh">⟳</button>
       </div>
       <div id="session-list"></div>
@@ -192,10 +194,10 @@
             <label>model
               <select id="sel-model">
                 <option value="">— keep —</option>
+                <option>claude-fable-5-2</option>
                 <option>claude-opus-5-5</option>
                 <option>claude-sonnet-5-5</option>
                 <option>claude-haiku-5-5</option>
-                <option>claude-fable-5-1</option>
               </select>
             </label>
             <label>permission
@@ -220,6 +222,7 @@
             </label>
             <button id="btn-interrupt" title="Interrupt the running turn">⛔ Interrupt</button>
             <span class="spacer"></span>
+            <button id="btn-pin" title="Pin or unpin this session in claude.ai/code's sidebar">Pin</button>
             <button id="btn-archive" class="danger" title="Archive this session">Archive</button>
           </div>
         </div>
@@ -289,6 +292,9 @@ function summaryOf(s) {
   const p = ((s && s.external_metadata) || {}).post_turn_summary || {};
   return p.needs_action || p.status_detail || "";
 }
+const PINNED_TAG = "ui:pinned";
+const isPinned = (s) => ((s && s.tags) || []).includes(PINNED_TAG);
+const isArchived = (s) => !!s && s.status === "archived";
 function classifyStatus(s) {
   const st = `${s.status || ""} ${s.worker_status || ""}`.toLowerCase();
   if (/(running|busy|thinking|working|processing)/.test(st)) return "busy";
@@ -315,9 +321,12 @@ async function loadWhoami() {
 // ---- sessions list -------------------------------------------------------
 async function loadSessions() {
   let sessions;
-  try { sessions = (await api("/api/sessions")).sessions || []; }
+  const all = $("show-archived").checked ? "?all=1" : "";
+  try { sessions = (await api("/api/sessions" + all)).sessions || []; }
   catch (e) { toast("List failed: " + e.message); return; }
-  S.sessions = sessions;
+  // Live sessions before archived ones, pins first among each (as claude.ai/code
+  // shows them); the sort is stable, so each group stays newest first.
+  S.sessions = sessions.sort((a, b) => isArchived(a) - isArchived(b) || isPinned(b) - isPinned(a));
   renderSessions();
 }
 function renderSessions() {
@@ -331,7 +340,7 @@ function renderSessions() {
     const row = el("div", "session" + (s.id === S.selectedId ? " active" : ""));
     row.appendChild(el("span", "status-dot " + classifyStatus(s)));
     const meta = el("div", "meta");
-    meta.appendChild(el("div", "title", s.title || "(untitled)"));
+    meta.appendChild(el("div", "title", (isPinned(s) ? "★ " : "") + (s.title || "(untitled)")));
     const model = (s.config && s.config.model) || "";
     const md = s.external_metadata || {};
     const sub = [s.worker_status || s.status, model, md.effort_level, contextLabel(md), timeAgo(s.last_event_at)]
@@ -377,6 +386,8 @@ function renderSessionHeader(s) {
   $("s-model").textContent = model || "model ?";
   $("s-dot").className = "status-dot " + classifyStatus(s);
   $("s-summary").textContent = summaryOf(s);
+  $("btn-pin").textContent = isPinned(s) ? "Unpin" : "Pin";
+  $("btn-archive").textContent = isArchived(s) ? "Unarchive" : "Archive";
   pickOption("sel-model", model);
   pickOption("sel-effort", meta.effort_level || "");
 }
@@ -390,7 +401,9 @@ function applyWorkerState(state) {
 }
 function pickOption(id, value) {
   const sel = $(id);
-  sel.value = [...sel.options].some(o => o.value === value) ? value : "";
+  // A value the page doesn't list (a newer model id, say) gets its own option.
+  if (value && ![...sel.options].some(o => o.value === value)) sel.add(new Option(value));
+  sel.value = value || "";
 }
 function openStream(id) {
   const es = new EventSource(`/api/sessions/${id}/stream?from_seq=${S.lastSeq}`);
@@ -420,9 +433,10 @@ function appendEvent(ev, live) {
     if (ev.sequence_num > S.lastSeq) S.lastSeq = ev.sequence_num;
   }
   applyWorkerState(ev.worker_state);
-  // Any controller's answer (ours echoing back included) or the turn ending
-  // settles a prompt: its buttons go.
-  if (ev.type === "control_response" && ev.request_id) settlePrompt(ev.request_id);
+  // A controller's answer (ours echoing back included), the worker withdrawing
+  // the prompt (answered at its terminal) or the turn ending settles a prompt:
+  // its buttons go.
+  if (ev.settles_prompt && ev.request_id) settlePrompt(ev.request_id);
   if (ev.type === "result") [...S.prompts.keys()].forEach(settlePrompt);
   const node = eventNode(ev);
   if (!node) return;
@@ -554,6 +568,19 @@ function autoGrow(ta) { ta.style.height = "42px"; ta.style.height = Math.min(180
 
 // ---- wire up -------------------------------------------------------------
 $("refresh-sessions").onclick = loadSessions;
+$("show-archived").onchange = loadSessions;
+$("btn-pin").onclick = async () => {
+  const s = S.session;
+  if (!s) return;
+  const pinned = !isPinned(s);
+  try {
+    const { tags } = await post(`/api/sessions/${s.id}/pin`, { pinned });
+    s.tags = tags;
+    if (S.session === s) renderSessionHeader(s);
+    toast(pinned ? "Pinned" : "Unpinned");
+    loadSessions();
+  } catch (e) { toast("Pin failed: " + e.message); }
+};
 $("btn-send").onclick = sendMessage;
 $("btn-aside").onclick = askAside;
 $("composer-text").addEventListener("input", (e) => autoGrow(e.target));
@@ -562,9 +589,20 @@ $("composer-text").addEventListener("keydown", (e) => {
 });
 $("btn-interrupt").onclick = () => steer("Interrupt", "interrupt", {}, "Interrupt sent");
 $("btn-archive").onclick = async () => {
-  if (!S.selectedId || !confirm("Archive this session?")) return;
+  const s = S.session;
+  if (!s) return;
+  if (isArchived(s)) {
+    try {
+      await post(`/api/sessions/${s.id}/unarchive`, {});
+      toast("Unarchived");
+      await loadSessions();
+      if (S.selectedId === s.id) selectSession(s.id);
+    } catch (e) { toast("Unarchive failed: " + e.message); }
+    return;
+  }
+  if (!confirm("Archive this session?")) return;
   try {
-    await post(`/api/sessions/${S.selectedId}/archive`, {});
+    await post(`/api/sessions/${s.id}/archive`, {});
     toast("Archived");
     if (S.es) S.es.close();
     S.selectedId = null; S.session = null;

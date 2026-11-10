@@ -23,7 +23,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 import httpx
 
@@ -50,7 +50,7 @@ from .events import (
     cli_user_message,
     user_message,
 )
-from .sse import parse_sse
+from .sse import SSEFrame, parse_sse
 
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 # Beta headers observed in the CLI. The /v1/code/* paths need none; CCR_BETA rides
@@ -69,6 +69,12 @@ ANTHROPIC_VERSION = "2023-06-01"
 # ever starting a turn (observed live on 2.1.234; 2.1.219 predates the gate).
 CLIENT_PLATFORM = "web_claude_ai"
 USER_AGENT = f"claude-rc-api-python/{__version__}"
+# The session tag claude.ai/code shows as a pin.
+PINNED_TAG = "ui:pinned"
+
+# The streams send a `:keepalive` comment about every 15 s. One silent for this
+# long is dead, whatever the socket says: redial it (the CLI's own limit).
+_STREAM_SILENCE_S = 45.0
 
 # Waiting for a control verdict: the history page size each poll scans, and how
 # far the poll interval backs off for slow verdicts (a side question can take
@@ -147,7 +153,12 @@ class ControlRejected(RuntimeError):
     The ingest POST succeeding only means the request was queued — the worker
     acks (or refuses) asynchronously in the event stream. A subtype the worker
     doesn't serve comes back as ``"REPL bridge does not handle control_request
-    subtype: …"``."""
+    subtype: …"``. ``error_code`` is the worker's machine-readable reason when
+    it gives one (``workspace_diff_pending``, ``invalid_mode`` …)."""
+
+    def __init__(self, message: str, error_code: Optional[str] = None):
+        super().__init__(message)
+        self.error_code = error_code
 
 
 class ControlTimeout(TimeoutError):
@@ -350,15 +361,32 @@ class RemoteControlClient:
             return resp.text
 
     # -- sessions ----------------------------------------------------------
-    def list_sessions(self, *, limit: int | None = None, cursor: str | None = None) -> dict:
-        """``GET /v1/code/sessions`` — your Remote Control sessions, newest first:
-        ``{data, next_cursor}``. Pass ``next_cursor`` back as ``cursor`` for the
-        next page."""
+    def list_sessions(
+        self,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+        statuses: str | Iterable[str] | None = None,
+        tags: str | Iterable[str] | None = None,
+        exclude_tags: str | Iterable[str] | None = None,
+    ) -> dict:
+        """``GET /v1/code/sessions`` — your sessions, newest first:
+        ``{data, next_cursor, resume_token}``. Pass ``next_cursor`` back as
+        ``cursor`` for the next page; ``resume_token`` is where
+        :meth:`watch_sessions` picks up from this page.
+
+        A page holds ``limit`` sessions (20 unless given, 200 at most), archived
+        ones included. Narrow it with ``statuses`` (``active`` | ``archived``),
+        ``tags`` (sessions carrying any of them, e.g. :data:`PINNED_TAG`) and
+        ``exclude_tags``; each takes one value or several."""
         params: dict[str, Any] = {}
         if limit is not None:
             params["limit"] = limit
         if cursor is not None:
             params["cursor"] = cursor
+        for name, value in (("statuses", statuses), ("tags", tags), ("exclude_tags", exclude_tags)):
+            if value is not None:
+                params[name] = [value] if isinstance(value, str) else list(value)
         return self._ok(self._request("GET", self._url(), params=params))
 
     def sessions(self, **kw) -> list[dict]:
@@ -386,13 +414,67 @@ class RemoteControlClient:
         worker adopts the new title too)."""
         return self.update_session(session_id, title=title)
 
+    def pin_session(self, session_id: str) -> dict:
+        """Pin a session in claude.ai/code's sidebar (the :data:`PINNED_TAG` tag).
+        Returns the updated session; ``list_sessions(tags=PINNED_TAG)`` lists pins."""
+        return self.update_session(session_id, add_tags=[PINNED_TAG])
+
+    def unpin_session(self, session_id: str) -> dict:
+        """Undo :meth:`pin_session`."""
+        return self.update_session(session_id, remove_tags=[PINNED_TAG])
+
     def archive_session(self, session_id: str) -> bool:
         """``POST /v1/code/sessions/{id}/archive`` — end/hide a session. 409 = already archived."""
-        resp = self._request("POST", self._url(session_id, "archive"), json={})
+        return self._transition(session_id, "archive")
+
+    def unarchive_session(self, session_id: str) -> bool:
+        """``POST /v1/code/sessions/{id}/unarchive`` — bring an archived session
+        back to ``active``. 409 = it wasn't archived."""
+        return self._transition(session_id, "unarchive")
+
+    def _transition(self, session_id: str, action: str) -> bool:
+        resp = self._request("POST", self._url(session_id, action), json={})
         if resp.status_code in (200, 409):
             return True
         self._ok(resp)  # raises
         return False
+
+    def watch_sessions(
+        self,
+        *,
+        resume_token: str | None = None,
+        reconnect: bool = True,
+        max_reconnects: int = 20,
+    ) -> Iterator[tuple[str, dict]]:
+        """``GET /v1/code/sessions/watch`` — live changes to your session list,
+        as ``(kind, session)``. ``kind`` is ``added`` the first time the watch
+        shows a session (a new one, or its first change since the watch began)
+        and ``changed`` after that: its status, title, tags or metadata moved.
+        ``session`` is the whole session object, as in a list page.
+
+        The watch runs from a ``resume_token``. Pass the one a
+        :meth:`list_sessions` page carried to follow on from that page with
+        nothing missed; without one it starts from now. The server issues a
+        newer token as it goes, and a reconnect resumes from that. A token too
+        old to resume from ends the watch with :class:`APIError` 410: list
+        again and start over.
+        """
+        token = resume_token or self.list_sessions(limit=1).get("resume_token")
+
+        def resume() -> tuple[dict, dict]:
+            return {}, ({"Last-Event-ID": token} if token else {})
+
+        url = self._url("watch")
+        for frame in self._sse_frames(url, resume, reconnect=reconnect, max_reconnects=max_reconnects):
+            if frame.event == "sync":  # caught up to here: the next resume point
+                token = frame.id or token
+            elif frame.event in ("added", "changed"):
+                try:
+                    session = json.loads(frame.data)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(session, dict):
+                    yield frame.event, session
 
     # -- sending events (steering) ----------------------------------------
     def send_events(self, session_id: str, events: Iterable[dict]) -> dict:
@@ -480,7 +562,7 @@ class RemoteControlClient:
         if verdict is None:
             raise ControlTimeout(request_id, f"no answer to {subtype} within {timeout:g}s")
         if verdict.get("subtype") == "error":
-            raise ControlRejected(str(verdict.get("error") or f"{subtype} rejected"))
+            raise ControlRejected(str(verdict.get("error") or f"{subtype} rejected"), verdict.get("error_code"))
         return request_id, verdict
 
     def request_control(self, session_id: str, subtype: str, *, timeout: float = 15.0, **fields: Any) -> dict:
@@ -523,7 +605,9 @@ class RemoteControlClient:
             else:
                 page = self.list_events(session_id, limit=_VERDICT_SCAN, sort_order="asc", cursor=str(cursor))
             for ev in page:
-                if ev.type == RC.CONTROL_RESPONSE and ev.request_id == request_id:
+                # Only the worker answers a controller's request; a controller's
+                # own `control_response` is its answer to a worker prompt.
+                if ev.type == RC.CONTROL_RESPONSE and ev.request_id == request_id and ev.source != "client":
                     return ev.payload.get("response") or {}
             if cursor is not None:
                 cursor = max([cursor, *(ev.sequence_num or 0 for ev in page)])
@@ -603,7 +687,7 @@ class RemoteControlClient:
         if resp.get("subtype") != "error":
             return {"via": "control", "ack": ack}
         if not command_fallback:
-            raise ControlRejected(str(resp.get("error") or "control request rejected"))
+            raise ControlRejected(str(resp.get("error") or "control request rejected"), resp.get("error_code"))
         command = "ultracode" if ultracode else (effort or "auto")
         ack = self.send_message(session_id, f"/effort {command}")
         return {"via": "command", "ack": ack}
@@ -679,11 +763,11 @@ class RemoteControlClient:
         task reports ``task_notification`` with ``status: stopped``."""
         self.request_control(session_id, "stop_task", task_id=task_id, timeout=timeout)
 
-    def mark_read(self, session_id: str, up_to_sequence_num: int | None = None) -> Any:
-        """``POST /v1/code/sessions/{id}/mark_read`` — mark the session read."""
-        body = {}
-        if up_to_sequence_num is not None:
-            body["sequence_num"] = up_to_sequence_num
+    def mark_read(self, session_id: str, event_id: str | None = None) -> Any:
+        """``POST /v1/code/sessions/{id}/mark_read`` — clear the session's
+        ``unread`` flag, optionally naming the last event read (its
+        ``Event.event_id``). Returns ``{"unread": false}``."""
+        body = {"event_id": event_id} if event_id else {}
         return self._ok(self._request("POST", self._url(session_id, "mark_read"), json=body), 200, 204)
 
     # -- reading events: polling ------------------------------------------
@@ -714,6 +798,49 @@ class RemoteControlClient:
         return [Event.from_wire(r) for r in rows]
 
     # -- reading events: streaming (SSE) ----------------------------------
+    def _sse_frames(
+        self,
+        url: str,
+        resume: Callable[[], tuple[dict, dict]],
+        *,
+        reconnect: bool,
+        max_reconnects: int,
+    ) -> Iterator[SSEFrame]:
+        """The frames of one of the API's SSE streams, redialled as needed.
+
+        ``resume()`` gives each dial's query params and extra headers, so a
+        redial picks up from wherever the caller has read to. A dropped or
+        silent connection redials with exponential backoff (``reconnect``),
+        and so does one the server closes. A connect refused for want of a
+        trusted device redials at once, ``reconnect`` or not, when a new device
+        token is in hand; any other refusal raises :class:`APIError`.
+        """
+        attempts = 0
+        while True:
+            params, extra = resume()
+            headers = self._headers({"Accept": "text/event-stream", **extra})
+            try:
+                with self._http.stream(
+                    "GET", url, headers=headers, params=params,
+                    timeout=httpx.Timeout(30.0, read=_STREAM_SILENCE_S),
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = resp.read().decode(errors="replace")
+                        if resp.status_code == 403 and self._renew_device_token(body):
+                            continue  # redial with the new trusted-device token
+                        raise APIError(resp.status_code, body, resp.headers.get("request-id"))
+                    attempts = 0
+                    for frame in parse_sse(resp.iter_lines()):
+                        if not frame.is_heartbeat:
+                            yield frame
+            except httpx.HTTPError:
+                if not reconnect or attempts >= max_reconnects:
+                    raise
+            if not reconnect:
+                return
+            attempts += 1
+            _backoff_sleep(attempts)
+
     def stream_events(
         self,
         session_id: str,
@@ -721,6 +848,7 @@ class RemoteControlClient:
         from_sequence_num: int = 0,
         reconnect: bool = True,
         max_reconnects: int = 20,
+        control_only: bool = False,
     ) -> Iterator[Event]:
         """``GET /v1/code/sessions/{id}/events/stream`` — live SSE events.
 
@@ -729,68 +857,52 @@ class RemoteControlClient:
         an envelope ``{event_type, sequence_num, source, payload}``; this unwraps
         ``payload`` into an :class:`Event`. ``ephemeral_event`` frames (partial
         ``stream_event`` deltas, ``system/thinking_tokens``) come through with no
-        sequence number; ``session_update`` / ``delivery_update`` frames are
-        skipped. Resumes with both ``?from_sequence_num=`` and a ``Last-Event-ID``
-        header, de-duping by ``sequence_num``, so a dropped connection neither
-        replays nor skips events. Reconnects with exponential backoff. A connect
-        refused for want of a trusted device reconnects at once (even with
-        ``reconnect=False``) when a new device token is in hand.
+        sequence number, and a ``catch_up_truncated`` frame (a gap in the replay)
+        as an event of that type. The stream's other frames (``session_update``,
+        ``delivery_update``, ``security_update``) are skipped. ``control_only``
+        asks the server for the control protocol alone: ``control_request`` and
+        ``control_response`` events.
+
+        Resumes with both ``?from_sequence_num=`` and a ``Last-Event-ID`` header,
+        de-duping by ``sequence_num``, so a dropped connection neither replays
+        nor skips events. Reconnects with exponential backoff, also when the
+        stream has been silent for 45 s (it sends keepalives about every 15 s).
+        A connect refused for want of a trusted device reconnects at once (even
+        with ``reconnect=False``) when a new device token is in hand.
         """
         seen: set[int] = set()
         last_seq = from_sequence_num
-        attempts = 0
-        while True:
+
+        def resume() -> tuple[dict, dict]:
             params: dict[str, Any] = {"from_sequence_num": last_seq}
-            headers = self._headers({"Accept": "text/event-stream"})
-            if last_seq:
-                headers["Last-Event-ID"] = str(last_seq)
-            url = self._url(session_id, "events", "stream")
+            if control_only:
+                params["control_only"] = "1"
+            return params, ({"Last-Event-ID": str(last_seq)} if last_seq else {})
+
+        url = self._url(session_id, "events", "stream")
+        for frame in self._sse_frames(url, resume, reconnect=reconnect, max_reconnects=max_reconnects):
+            # The RC stream marks each frame's sequence_num on the id: line.
+            if frame.id:
+                try:
+                    last_seq = max(last_seq, int(frame.id))
+                except ValueError:
+                    pass
             try:
-                with self._http.stream(
-                    "GET", url, headers=headers, params=params,
-                    timeout=httpx.Timeout(30.0, read=None),
-                ) as resp:
-                    if resp.status_code != 200:
-                        body = resp.read().decode(errors="replace")
-                        if resp.status_code == 403 and self._renew_device_token(body):
-                            continue  # reconnect with the new trusted-device token
-                        raise APIError(resp.status_code, body, resp.headers.get("request-id"))
-                    attempts = 0
-                    for frame in parse_sse(resp.iter_lines()):
-                        if frame.is_heartbeat:
-                            continue
-                        # The RC stream marks each frame's sequence_num on the id: line.
-                        if frame.id:
-                            try:
-                                last_seq = max(last_seq, int(frame.id))
-                            except ValueError:
-                                pass
-                        # Ignore purely informational top-level events.
-                        if frame.event in ("session_update", "delivery_update"):
-                            continue
-                        try:
-                            data = json.loads(frame.data)
-                        except (json.JSONDecodeError, TypeError):
-                            continue
-                        # `catch_up_truncated` signals a history gap; surface it raw.
-                        if frame.event == "catch_up_truncated" or "payload" not in data:
-                            yield Event.from_wire(data)
-                            continue
-                        ev = Event.from_wire(data)
-                        if ev.sequence_num is not None:
-                            if ev.sequence_num in seen:
-                                continue
-                            seen.add(ev.sequence_num)
-                            last_seq = max(last_seq, ev.sequence_num)
-                        yield ev
-            except httpx.HTTPError:
-                if not reconnect or attempts >= max_reconnects:
-                    raise
-                attempts += 1
-                _backoff_sleep(attempts)
+                data = json.loads(frame.data)
+            except (json.JSONDecodeError, TypeError):
                 continue
-            if not reconnect:
-                return
+            if frame.event == "catch_up_truncated":
+                yield Event(payload={**(data if isinstance(data, dict) else {}), "type": RC.CATCH_UP_TRUNCATED})
+                continue
+            if not (isinstance(data, dict) and isinstance(data.get("payload"), dict)):
+                continue  # session_update, delivery_update, security_update …
+            ev = Event.from_wire(data)
+            if ev.sequence_num is not None:
+                if ev.sequence_num in seen:
+                    continue
+                seen.add(ev.sequence_num)
+                last_seq = max(last_seq, ev.sequence_num)
+            yield ev
 
     # -- presence ----------------------------------------------------------
     def presence(self, session_id: str, *, clear: bool = False) -> None:
@@ -822,7 +934,11 @@ class RemoteControlClient:
         is a generator, so the HTTP connection only opens on the first iteration
         below — *after* the send — but the stream is resumed from the newest
         sequence number that existed beforehand, so the server replays anything
-        that happened in between.
+        that happened in between. A dropped connection resumes the same way.
+
+        The turn that ends is the next one to finish. A message sent while a
+        turn is running usually joins that turn; when it waits for a turn of
+        its own instead, this returns at the end of the running one.
         """
         # Seed the resume cursor from the newest event so we only see new ones.
         try:
@@ -832,7 +948,7 @@ class RemoteControlClient:
             start = 0
 
         collected: list[Event] = []
-        stream = self.stream_events(session_id, from_sequence_num=start, reconnect=False)
+        stream = self.stream_events(session_id, from_sequence_num=start)
         self.send_message(session_id, text)
         for ev in stream:
             collected.append(ev)

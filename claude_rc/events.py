@@ -42,8 +42,10 @@ class RC:
     STREAM_EVENT = "stream_event"  # partial streaming (message_start, content_block_delta, ...)
     CONTROL_REQUEST = "control_request"
     CONTROL_RESPONSE = "control_response"
-    CONTROL_CANCEL_REQUEST = "control_cancel_request"
+    CONTROL_CANCEL_REQUEST = "control_cancel_request"  # withdraws a request: a controller's, or the worker's own prompt
     RATE_LIMIT_EVENT = "rate_limit_event"
+    CONVERSATION_RESET = "conversation_reset"  # /clear and friends: what came before is no longer the conversation
+    CATCH_UP_TRUNCATED = "catch_up_truncated"  # stream only: the replay skipped part of the history
 
 
 class RCSystem:
@@ -58,6 +60,8 @@ class RCSystem:
     BACKGROUND_TASKS_CHANGED = "background_tasks_changed"  # tasks: the running background set
     CONTROL_REQUEST_PROGRESS = "control_request_progress"  # e.g. a side_question working
     INFORMATIONAL = "informational"
+    VCS_STATE_CHANGED = "vcs_state_changed"  # the worker's repo moved: cwd + kind (e.g. "push")
+    WORKER_SHUTTING_DOWN = "worker_shutting_down"  # the Claude Code process is exiting (reason)
 
 
 # --- Managed Agents event types --------------------------------------------
@@ -195,9 +199,10 @@ class Event:
     # -- control protocol ----------------------------------------------------
     @property
     def request_id(self) -> Optional[str]:
-        """The id a ``control_request`` carries, or the one a ``control_response``
-        answers; None for every other event."""
-        if self.type == RC.CONTROL_REQUEST:
+        """The id a ``control_request`` carries, the one a ``control_response``
+        answers, or the one a ``control_cancel_request`` withdraws; None for
+        every other event."""
+        if self.type in (RC.CONTROL_REQUEST, RC.CONTROL_CANCEL_REQUEST):
             return self.payload.get("request_id")
         if self.type == RC.CONTROL_RESPONSE:
             return (self.payload.get("response") or {}).get("request_id") or self.payload.get("request_id")
@@ -240,6 +245,16 @@ class Event:
         controller answers. Requests a controller sent — your own echoing back, or
         claude.ai's — never block anything."""
         return self.control_subtype in BLOCKING_CONTROL_SUBTYPES and self.source != "client"
+
+    @property
+    def settles_prompt(self) -> bool:
+        """This event ends a blocking prompt, the one its ``request_id`` names:
+        a controller's answer (any controller's, echoed to all), or the worker
+        withdrawing the prompt because it was answered at the terminal or its
+        turn was interrupted."""
+        if self.type == RC.CONTROL_RESPONSE:
+            return self.source != "worker"  # a worker's is its verdict on a controller's request
+        return self.type == RC.CONTROL_CANCEL_REQUEST and self.source != "client"
 
     @classmethod
     def from_wire(cls, obj: dict[str, Any]) -> "Event":

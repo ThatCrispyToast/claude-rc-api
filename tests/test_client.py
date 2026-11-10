@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_rc.sse import parse_sse, SSEFrame
+from claude_rc.sse import parse_sse
 from claude_rc.events import (
     Event,
     cli_user_message,
@@ -110,7 +110,7 @@ def test_cli_control_request_effort_shape():
 
 
 # --- set_effort verdict handling (offline: transport methods stubbed) -------
-def _bare_rc() -> "RemoteControlClient":
+def _bare_rc():
     from claude_rc.client import RemoteControlClient
 
     return RemoteControlClient.__new__(RemoteControlClient)  # skip __init__ / creds
@@ -1306,6 +1306,235 @@ def test_refresh_keeps_a_device_token_enrolled_since(tmp_path: Path):
     assert json.loads(p.read_text())["trustedDeviceToken"] == "new-dev"
 
 
+# --- the session list: filters, pins, archive/unarchive, mark_read -------------
+def _recording_rc(monkeypatch, answer=None):
+    """A client whose ``_request`` records ``(method, url, params | json)``."""
+    import httpx
+
+    rc = _bare_rc()
+    rc.base_url = "https://api.example"
+    seen = []
+
+    def fake_request(method, url, **kw):
+        seen.append((method, url, kw.get("params") if method == "GET" else kw.get("json")))
+        return answer(method, url) if answer else httpx.Response(200, json={"session": {"id": "cse_x"}})
+
+    monkeypatch.setattr(rc, "_request", fake_request)
+    return rc, seen
+
+
+def test_list_sessions_filters(monkeypatch):
+    import httpx
+
+    page = {"data": [{"id": "cse_x"}], "next_cursor": None, "resume_token": "tok"}
+    rc, seen = _recording_rc(monkeypatch, lambda method, url: httpx.Response(200, json=page))
+    assert rc.list_sessions() == page
+    assert rc.sessions(limit=5, statuses="active", tags=["ui:pinned", "x"], exclude_tags="y") == [{"id": "cse_x"}]
+    assert seen[0][2] == {}
+    assert seen[1][2] == {"limit": 5, "statuses": ["active"], "tags": ["ui:pinned", "x"], "exclude_tags": ["y"]}
+    # httpx repeats a list-valued param, which is how the API takes several.
+    assert str(httpx.QueryParams(seen[1][2])) == "limit=5&statuses=active&tags=ui%3Apinned&tags=x&exclude_tags=y"
+
+
+def test_pin_unarchive_and_mark_read(monkeypatch):
+    import httpx
+
+    from claude_rc.client import PINNED_TAG, APIError
+
+    statuses = iter([200, 200, 409, 403])
+
+    def answer(method, url):
+        if method == "PUT":
+            return httpx.Response(200, json={"session": {"id": "cse_x", "tags": [PINNED_TAG]}})
+        if url.endswith("/mark_read"):
+            return httpx.Response(200, json={"unread": False})
+        return httpx.Response(next(statuses), json={"session": {"id": "cse_x"}})
+
+    rc, seen = _recording_rc(monkeypatch, answer)
+    url = "https://api.example/v1/code/sessions/cse_x"
+    assert rc.pin_session("cse_x")["tags"] == [PINNED_TAG]
+    rc.unpin_session("cse_x")
+    assert seen == [("PUT", url, {"add_tags": ["ui:pinned"]}), ("PUT", url, {"remove_tags": ["ui:pinned"]})]
+
+    assert rc.archive_session("cse_x") and rc.unarchive_session("cse_x")
+    assert rc.unarchive_session("cse_x")  # 409: it wasn't archived
+    with pytest.raises(APIError):
+        rc.unarchive_session("cse_x")
+    assert [u for _, u, _ in seen[2:]] == [url + "/archive", url + "/unarchive", url + "/unarchive", url + "/unarchive"]
+
+    assert rc.mark_read("cse_x") == {"unread": False}
+    rc.mark_read("cse_x", "0b9c0d4e-0000-4000-8000-000000000000")
+    assert [body for _, _, body in seen[6:]] == [{}, {"event_id": "0b9c0d4e-0000-4000-8000-000000000000"}]
+
+
+# --- SSE streams (offline: an httpx MockTransport plays the server) ------------
+def _sse(*frames):
+    """An SSE body: each frame is ``(event, data)`` or ``(event, data, id)``."""
+    out = [":keepalive\n\n"]
+    for event, data, *ident in frames:
+        out.append(f"event: {event}\n" + (f"id: {ident[0]}\n" if ident else "") + f"data: {json.dumps(data)}\n\n")
+    return "".join(out)
+
+
+def _stream_rc(handler, monkeypatch):
+    import httpx
+
+    monkeypatch.setattr("claude_rc.client.time.sleep", lambda s: None)
+    return _bare_rc_with(_oauth_creds(), httpx.Client(transport=httpx.MockTransport(handler)))
+
+
+def _client_event(seq, payload, **envelope):
+    return ("client_event", {"sequence_num": str(seq), "source": "worker", "payload": payload, **envelope}, seq)
+
+
+def test_stream_skips_the_frames_that_are_not_events(monkeypatch):
+    import httpx
+
+    seen = []
+
+    def handler(req):
+        seen.append(dict(req.url.params))
+        return httpx.Response(200, text=_sse(
+            ("session_update", {"connection_status": "connected"}),
+            ("security_update", {"security_tier": "elevated"}),
+            ("delivery_update", {"event_id": "e", "status": "DELIVERY_STATUS_PROCESSED"}),
+            _client_event(7, {"type": "control_request", "request_id": "r"}),
+            ("ephemeral_event", {"payload": {"type": "stream_event"}}),
+            ("catch_up_truncated", {"dropped": 3}),
+        ))
+
+    rc = _stream_rc(handler, monkeypatch)
+    events = list(rc.stream_events("cse_x", from_sequence_num=5, reconnect=False, control_only=True))
+    assert [(e.type, e.sequence_num) for e in events] == [
+        ("control_request", 7), ("stream_event", None), ("catch_up_truncated", None)]
+    assert events[2].payload["dropped"] == 3
+    assert seen == [{"from_sequence_num": "5", "control_only": "1"}]
+    rc._http.close()
+
+
+def test_stream_resumes_after_silence_and_after_a_close(monkeypatch):
+    """A stream gone silent (the read timeout) or closed by the server redials
+    from the last sequence number, and replayed events aren't repeated."""
+    import httpx
+
+    dials = []
+
+    def handler(req):
+        assert req.extensions["timeout"]["read"] == 45.0  # keepalives come about every 15 s
+        dials.append((req.url.params.get("from_sequence_num"), req.headers.get("Last-Event-ID")))
+        if len(dials) == 1:
+            return httpx.Response(200, text=_sse(_client_event(1, {"type": "assistant"})))  # then closes
+        if len(dials) == 2:
+            raise httpx.ReadTimeout("silent", request=req)
+        return httpx.Response(200, text=_sse(
+            _client_event(1, {"type": "assistant"}), _client_event(2, {"type": "result", "subtype": "success"})))
+
+    rc = _stream_rc(handler, monkeypatch)
+    stream = rc.stream_events("cse_x")
+    assert [next(stream).sequence_num, next(stream).sequence_num] == [1, 2]
+    assert dials == [("0", None), ("1", "1"), ("1", "1")]
+    stream.close()
+    rc._http.close()
+
+
+def test_send_and_collect_survives_a_dropped_stream(monkeypatch):
+    import httpx
+
+    posts = []
+
+    def handler(req):
+        if req.method == "POST":
+            posts.append(json.loads(req.content))
+            return httpx.Response(200, json=_ack(11))
+        if req.url.path.endswith("/events"):  # the newest event before the send
+            return httpx.Response(200, json={"data": [{"sequence_num": "10", "payload": {"type": "result"}}]})
+        if req.url.params["from_sequence_num"] == "10":
+            return httpx.Response(200, text=_sse(_client_event(12, {"type": "assistant"})))  # then drops
+        return httpx.Response(200, text=_sse(_client_event(13, {"type": "result", "subtype": "success"})))
+
+    rc = _stream_rc(handler, monkeypatch)
+    assert [e.sequence_num for e in rc.send_and_collect("cse_x", "go")] == [12, 13]
+    assert posts[0]["events"][0]["payload"]["message"]["content"][0]["text"] == "go"
+    rc._http.close()
+
+
+def test_watch_sessions(monkeypatch):
+    """The watch starts from the list's resume token, yields added/changed
+    sessions, and redials from the newest token a ``sync`` frame gave."""
+    import httpx
+
+    from claude_rc.client import APIError
+
+    tokens = []
+
+    def handler(req):
+        if req.url.path == "/v1/code/sessions":
+            assert dict(req.url.params) == {"limit": "1"}
+            return httpx.Response(200, json={"data": [], "resume_token": "tok-0"})
+        assert req.url.path == "/v1/code/sessions/watch"
+        tokens.append(req.headers.get("Last-Event-ID"))
+        if len(tokens) == 1:
+            return httpx.Response(200, text=_sse(
+                ("sync", {}, "tok-1"), ("added", {"id": "cse_a"}), ("sync", {}, "tok-2"), ("removed", {"id": "cse_z"})))
+        if len(tokens) == 2:
+            return httpx.Response(200, text=_sse(("changed", {"id": "cse_a", "title": "t"})))
+        return httpx.Response(410, text="resume_token expired")
+
+    rc = _stream_rc(handler, monkeypatch)
+    watch = rc.watch_sessions()
+    assert next(watch) == ("added", {"id": "cse_a"})
+    assert next(watch) == ("changed", {"id": "cse_a", "title": "t"})
+    with pytest.raises(APIError) as exc:
+        next(watch)
+    assert exc.value.status == 410
+    assert tokens == ["tok-0", "tok-2", "tok-2"]
+
+    tokens.clear()
+    assert next(rc.watch_sessions(resume_token="from-my-list")) == ("added", {"id": "cse_a"})
+    assert tokens == ["from-my-list"]
+    rc._http.close()
+
+
+# --- the control protocol's finer points ----------------------------------------
+def test_wait_control_response_takes_only_the_workers_answer(monkeypatch):
+    """A controller's control_response carrying the same id is a prompt answer
+    echoing by, not the verdict on our request."""
+    rc = _bare_rc()
+    echo = Event.from_wire(_wire(
+        {"type": "control_response", "response": {"request_id": "rid-1", "subtype": "success"}}, source="client"
+    ) | {"sequence_num": "41"})
+    verdict = _verdict_event(42, "rid-1", subtype="error", error="no")
+    monkeypatch.setattr(rc, "list_events", lambda sid, **kw: [echo, verdict])
+    assert rc.wait_control_response("cse_x", "rid-1", after_sequence_num=40)["subtype"] == "error"
+
+
+def test_control_rejected_carries_the_error_code(monkeypatch):
+    from claude_rc.client import ControlRejected
+
+    rc = _bare_rc()
+    monkeypatch.setattr(rc, "send_events", lambda sid, evs: _ack(1))
+    monkeypatch.setattr(rc, "wait_control_response", lambda sid, rid, **kw: {
+        "subtype": "error", "error": "get_workspace_diff timed out", "error_code": "workspace_diff_pending"})
+    with pytest.raises(ControlRejected, match="timed out") as exc:
+        rc.get_workspace_diff("cse_x")
+    assert exc.value.error_code == "workspace_diff_pending"
+    assert ControlRejected("plain").error_code is None
+
+
+def test_events_that_settle_a_prompt():
+    """A prompt ends on a controller's answer, or on the worker withdrawing it
+    (answered at the terminal); a worker's verdicts and a controller's own
+    cancels are about other requests."""
+    answer = {"type": "control_response", "response": {"request_id": "p1", "subtype": "success"}}
+    cancel = {"type": "control_cancel_request", "request_id": "p1"}
+    assert Event.from_wire(_wire(answer, source="client")).settles_prompt
+    assert not Event.from_wire(_wire(answer, source="worker")).settles_prompt
+    withdrawn = Event.from_wire(_wire(cancel, source="worker"))
+    assert withdrawn.settles_prompt and withdrawn.request_id == "p1"
+    assert not Event.from_wire(_wire(cancel, source="client")).settles_prompt
+    assert not Event.from_wire(_wire({"type": "result"}, source="worker")).settles_prompt
+
+
 # --- refreshTokenExpiresAt: when the login ends ---------------------------------
 @pytest.mark.parametrize("stored, granted_s, kept", [
     ("soon", None, "soon"),      # the response names no lifetime: the stored end stays
@@ -1338,3 +1567,61 @@ def test_refresh_keeps_when_the_login_ends(tmp_path: Path, stored, granted_s, ke
         assert now + 3600_000 <= saved < now + 3700_000
     else:
         assert saved == ends.get(kept)
+
+
+# --- CLI ------------------------------------------------------------------------
+def test_cli_list_and_pin(monkeypatch, capsys):
+    from claude_rc import cli
+
+    calls = []
+
+    class FakeRC:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def sessions(self, **kw):
+            calls.append(("sessions", kw))
+            return [{"id": "cse_a", "status": "active", "title": "[wip] a", "tags": ["ui:pinned"]}]
+
+        def pin_session(self, sid):
+            calls.append(("pin", sid))
+            return {"title": "a"}
+
+        def unpin_session(self, sid):
+            calls.append(("unpin", sid))
+            return {"title": "a"}
+
+    monkeypatch.setattr(cli, "RemoteControlClient", FakeRC)
+    assert cli.main(["list"]) == 0
+    assert cli.main(["list", "--all", "--pinned", "--limit", "5"]) == 0
+    assert cli.main(["pin", "cse_a"]) == 0 and cli.main(["unpin", "cse_a"]) == 0
+    assert calls == [
+        ("sessions", {"limit": None, "statuses": "active", "tags": None}),
+        ("sessions", {"limit": 5, "statuses": None, "tags": "ui:pinned"}),
+        ("pin", "cse_a"), ("unpin", "cse_a"),
+    ]
+    out = capsys.readouterr().out
+    assert "[wip] a" in out  # a title's brackets are text, not markup
+    assert "unpinned → a" in out
+
+
+def test_cli_reports_an_api_error(monkeypatch, capsys):
+    from claude_rc import cli
+    from claude_rc.client import APIError
+
+    class FakeRC:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def get_session(self, sid):
+            raise APIError(404, '{"error": "no such session"}')
+
+    monkeypatch.setattr(cli, "RemoteControlClient", FakeRC)
+    assert cli.main(["get", "cse_missing"]) == 1
+    assert "api error: HTTP 404" in capsys.readouterr().out

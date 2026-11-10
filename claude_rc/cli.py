@@ -1,7 +1,7 @@
 """Command-line interface for the Claude Remote Control API.
 
     claude-rc whoami                 # show login / org / token status
-    claude-rc list                   # list your Remote Control sessions
+    claude-rc list                   # your active sessions (--all adds archived, --pinned filters)
     claude-rc get <session_id>       # session details
     claude-rc events <session_id>    # recent events (history)
     claude-rc watch <session_id>     # stream events live (read-only)
@@ -10,10 +10,11 @@
     claude-rc send <session_id> "run the tests"   # send a message, print the reply
     claude-rc repl <session_id>      # interactive chat with a live session
     claude-rc rename <session_id> "new title"
+    claude-rc pin <session_id>       # pin it in claude.ai/code's sidebar (unpin undoes it)
     claude-rc web                    # browser control panel for all sessions
 
-`send`, `repl`, `rename`, and `web` steer live sessions — only use them on
-sessions you started with `claude remote-control`. `ask` and `info` query the
+`send`, `repl`, `rename`, `pin`, and `web` change live sessions — only use them
+on sessions you started with `claude remote-control`. `ask` and `info` query the
 worker (a side question costs a model call; neither touches the transcript).
 """
 
@@ -25,7 +26,7 @@ import sys
 from typing import Optional
 
 from . import __version__
-from .client import ControlRejected, ControlTimeout, RemoteControlClient
+from .client import PINNED_TAG, APIError, ControlRejected, ControlTimeout, RemoteControlClient
 from .credentials import CredentialsError, load_credentials, load_org_uuid
 
 try:  # optional pretty output
@@ -77,7 +78,7 @@ def cmd_whoami(args) -> int:
     _print(f"expired      : {creds.is_expired()}")
     _print(f"scopes       : {', '.join(creds.scopes) or '(unknown)'}")
     _print(f"subscription : {creds.subscription_type or '-'}")
-    _print(f"org uuid     : {'present' if org else 'MISSING — set CLAUDE_RC_ORG_UUID'}")
+    _print(f"org uuid     : {'present' if org else 'absent (optional: /v1/code/sessions works without it)'}")
     return 0
 
 
@@ -90,15 +91,20 @@ def _context_pct(session: dict) -> str:
 
 def cmd_list(args) -> int:
     with RemoteControlClient() as rc:
-        sessions = rc.sessions(limit=args.limit)
+        sessions = rc.sessions(
+            limit=args.limit,
+            statuses=None if args.all else "active",
+            tags=PINNED_TAG if args.pinned else None,
+        )
     if _console:
         table = Table(title=f"{len(sessions)} Remote Control sessions")
         for col in ("id", "title", "status", "worker", "model", "effort", "ctx", "last activity"):
             table.add_column(col, overflow="fold")
         for s in sessions:
+            pin = "★ " if PINNED_TAG in (s.get("tags") or []) else ""
             table.add_row(
                 s.get("id", ""),
-                (s.get("title") or "")[:50],
+                _esc(pin + (s.get("title") or "")[:50]),
                 str(s.get("status", "")),
                 str(s.get("worker_status", "")),
                 (s.get("config") or {}).get("model", ""),
@@ -177,6 +183,16 @@ def cmd_rename(args) -> int:
     return 0
 
 
+def cmd_pin(args) -> int:
+    with RemoteControlClient() as rc:
+        if args.cmd == "pin":
+            done, session = "pinned", rc.pin_session(args.session_id)
+        else:
+            done, session = "unpinned", rc.unpin_session(args.session_id)
+    _print(_esc(f"{done} → {session.get('title')}"))
+    return 0
+
+
 def cmd_send(args) -> int:
     with RemoteControlClient() as rc:
         for e in rc.send_and_collect(args.session_id, args.message):
@@ -241,8 +257,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("whoami", help="show login / org / token status").set_defaults(func=cmd_whoami)
 
-    pl = sub.add_parser("list", help="list Remote Control sessions")
-    pl.add_argument("--limit", type=int, default=None)
+    pl = sub.add_parser("list", help="list Remote Control sessions (active ones unless --all)")
+    pl.add_argument("--limit", type=int, default=None, help="page size (server default 20, at most 200)")
+    pl.add_argument("--all", action="store_true", help="include archived sessions")
+    pl.add_argument("--pinned", action="store_true", help="only sessions pinned in claude.ai/code")
     pl.set_defaults(func=cmd_list)
 
     pg = sub.add_parser("get", help="session details (JSON)")
@@ -273,6 +291,11 @@ def build_parser() -> argparse.ArgumentParser:
     pn.add_argument("title")
     pn.set_defaults(func=cmd_rename)
 
+    for name, what in (("pin", "pin a session in claude.ai/code's sidebar"), ("unpin", "remove a session's pin")):
+        pp = sub.add_parser(name, help=what)
+        pp.add_argument("session_id")
+        pp.set_defaults(func=cmd_pin)
+
     ps = sub.add_parser("send", help="send a message and print the reply")
     ps.add_argument("session_id")
     ps.add_argument("message")
@@ -299,7 +322,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         _print(f"auth error: {e}")
         return 1
     except (ControlRejected, ControlTimeout) as e:
-        _print(f"worker: {e}")
+        _print(_esc(f"worker: {e}"))
+        return 1
+    except APIError as e:
+        _print(_esc(f"api error: {e}"))
         return 1
     except KeyboardInterrupt:
         return 130

@@ -1,4 +1,4 @@
-"""List your Remote Control sessions and watch one live (read-only).
+"""List your active Remote Control sessions and watch one live (read-only).
 
     python examples/list_and_watch.py            # list
     python examples/list_and_watch.py <cse_id>   # stream that session
@@ -11,8 +11,8 @@ from claude_rc import RemoteControlClient
 def main() -> None:
     with RemoteControlClient() as rc:
         if len(sys.argv) < 2:
-            for s in rc.sessions():
-                print(f"{s['id']}  {s.get('status'):8}  {s.get('title', '')[:60]}")
+            for s in rc.sessions(statuses="active"):
+                print(f"{s['id']}  {s.get('worker_status', ''):8}  {(s.get('title') or '')[:60]}")
             print("\nPass a session id to stream it live.")
             return
 

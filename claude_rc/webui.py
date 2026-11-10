@@ -3,7 +3,7 @@
 Serves a single-page UI that lists your Remote Control sessions, watches the
 live event stream of one, sends messages, asks side questions, answers
 permission prompts, and steers it (interrupt / model / permission mode / effort /
-archive) — all on top of :class:`~claude_rc.client.RemoteControlClient`.
+pin / archive) — all on top of :class:`~claude_rc.client.RemoteControlClient`.
 
 It is built on the standard-library :mod:`http.server`, so it adds **no new
 dependencies** beyond what the client already needs. Launch it with::
@@ -24,7 +24,7 @@ HTTP surface (all JSON unless noted):
 
     GET  /                                    the single-page UI
     GET  /api/whoami                          login / org / token status
-    GET  /api/sessions                        {"sessions": [...]}
+    GET  /api/sessions?all=                   {"sessions": [...]} (active ones; all=1 adds archived)
     GET  /api/sessions/{id}                   session detail
     GET  /api/sessions/{id}/events?limit=     {"events": [...]} (the newest, oldest first)
     GET  /api/sessions/{id}/stream?from_seq=  live events as text/event-stream
@@ -35,8 +35,10 @@ HTTP surface (all JSON unless noted):
     POST /api/sessions/{id}/model             {"model": ...}
     POST /api/sessions/{id}/permission_mode   {"mode": ...}
     POST /api/sessions/{id}/effort            {"effort": "low".."max" | null}
-    POST /api/sessions/{id}/mark_read         {"sequence_num": ...?}
+    POST /api/sessions/{id}/mark_read         {"event_id": ...?}
+    POST /api/sessions/{id}/pin               {"pinned": true | false}
     POST /api/sessions/{id}/archive
+    POST /api/sessions/{id}/unarchive
 """
 
 from __future__ import annotations
@@ -55,6 +57,7 @@ from .events import Event
 
 _STATIC = Path(__file__).parent / "static"
 _PAGE = _STATIC / "index.html"
+_LIST_LIMIT = 50  # sessions per sidebar fetch
 
 # --- route patterns (path is matched against these, first hit wins) --------
 _SID = r"(?P<sid>[^/]+)"
@@ -69,7 +72,8 @@ _R_MODEL = re.compile(rf"^/api/sessions/{_SID}/model$")
 _R_PERM = re.compile(rf"^/api/sessions/{_SID}/permission_mode$")
 _R_EFFORT = re.compile(rf"^/api/sessions/{_SID}/effort$")
 _R_MARK = re.compile(rf"^/api/sessions/{_SID}/mark_read$")
-_R_ARCHIVE = re.compile(rf"^/api/sessions/{_SID}/archive$")
+_R_PIN = re.compile(rf"^/api/sessions/{_SID}/pin$")
+_R_ARCHIVE = re.compile(rf"^/api/sessions/{_SID}/(?P<action>archive|unarchive)$")
 
 
 def event_to_dict(ev: Event) -> dict:
@@ -93,6 +97,7 @@ def event_to_dict(ev: Event) -> dict:
         "is_turn_end": ev.is_turn_end,
         "is_terminal": ev.is_terminal,
         "is_blocking_control": ev.is_blocking_control,
+        "settles_prompt": ev.settles_prompt,
         "blocking_subtype": ev.control_subtype if ev.is_blocking_control else None,
         "request_id": ev.request_id,
         "tool_name": request.get("tool_name"),
@@ -174,7 +179,9 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/whoami":
                 return self._json(self._whoami())
             if path == "/api/sessions":
-                return self._json({"sessions": self.rc.sessions()})
+                everything = self._query().get("all", ["0"])[0] not in ("", "0")
+                sessions = self.rc.sessions(limit=_LIST_LIMIT, statuses=None if everything else "active")
+                return self._json({"sessions": sessions})
             m = _R_STREAM.match(path)
             if m:
                 return self._stream(m["sid"])
@@ -251,12 +258,19 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "via": out["via"]})
             m = _R_MARK.match(path)
             if m:
-                seq = body.get("sequence_num")
-                self.rc.mark_read(m["sid"], seq if isinstance(seq, int) else None)
+                event_id = body.get("event_id")
+                self.rc.mark_read(m["sid"], event_id if isinstance(event_id, str) else None)
                 return self._json({"ok": True})
+            m = _R_PIN.match(path)
+            if m:
+                change = self.rc.pin_session if body.get("pinned", True) else self.rc.unpin_session
+                return self._json({"ok": True, "tags": change(m["sid"]).get("tags") or []})
             m = _R_ARCHIVE.match(path)
             if m:
-                self.rc.archive_session(m["sid"])
+                if m["action"] == "archive":
+                    self.rc.archive_session(m["sid"])
+                else:
+                    self.rc.unarchive_session(m["sid"])
                 return self._json({"ok": True})
             self._json({"error": "not found"}, status=404)
         except (BrokenPipeError, ConnectionResetError):
