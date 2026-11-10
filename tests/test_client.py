@@ -1304,3 +1304,37 @@ def test_refresh_keeps_a_device_token_enrolled_since(tmp_path: Path):
     with _token_endpoint() as http:
         refresh_credentials(creds, client=http)
     assert json.loads(p.read_text())["trustedDeviceToken"] == "new-dev"
+
+
+# --- refreshTokenExpiresAt: when the login ends ---------------------------------
+@pytest.mark.parametrize("stored, granted_s, kept", [
+    ("soon", None, "soon"),      # the response names no lifetime: the stored end stays
+    ("soon", 86400 * 30, "soon"),  # a refresh never moves the end later
+    ("later", 3600, "granted"),  # …but an earlier one in the response wins
+    (123, 3600, None),           # not a time the CLI would trust: removed
+    (True, None, None),
+    (None, 3600, None),          # the login recorded no end: none is invented
+])
+def test_refresh_keeps_when_the_login_ends(tmp_path: Path, stored, granted_s, kept):
+    import httpx
+
+    from claude_rc import credentials as cr
+
+    now = cr._now_ms()
+    ends = {"soon": now + 86400_000, "later": now + 90 * 86400_000}
+    p = tmp_path / ".credentials.json"
+    _write_creds(p, "old-token", "old-refresh", 1)
+    doc = json.loads(p.read_text())
+    if stored is not None:
+        doc["claudeAiOauth"]["refreshTokenExpiresAt"] = ends.get(stored, stored)
+        p.write_text(json.dumps(doc))
+    body = {"access_token": "new-token", "refresh_token": "new-refresh", "expires_in": 3600}
+    if granted_s is not None:
+        body["refresh_token_expires_in"] = granted_s
+    with httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=body))) as http:
+        cr.refresh_credentials(load_credentials(p), client=http)
+    saved = json.loads(p.read_text())["claudeAiOauth"].get("refreshTokenExpiresAt")
+    if kept == "granted":
+        assert now + 3600_000 <= saved < now + 3700_000
+    else:
+        assert saved == ends.get(kept)

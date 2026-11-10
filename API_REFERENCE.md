@@ -88,7 +88,12 @@ token spent), adopts tokens another process already rotated, and saves with a
 compare-and-swap: only while the stored `refreshToken` is still the one it
 posted (or `""`). A store that a sign-in or sign-out has changed is left
 alone. It keeps the block's other fields (`subscriptionType`, `rateLimitTier`,
-…), and every store write holds `~/.claude/.storage-write.lock`. This
+…), and every store write holds `~/.claude/.storage-write.lock`.
+`refreshTokenExpiresAt` is when the login as a whole ends (the CLI warns as it
+nears), and a refresh never moves it later (2.1.322): the stored time stays, or
+drops to the response's `refresh_token_expires_in` when that is sooner. A
+stored value that isn't an epoch-ms time between 2025 and ten years ahead is
+removed. This
 library follows the same rules without the two locks, and a little stricter:
 a Keychain it can't read stops the refresh (the CLI may still refresh from
 its 30-second cache). `RemoteControlClient` adopts rotated tokens, and
@@ -124,8 +129,10 @@ User-Agent: anthropic-sdk-typescript/0.94.0 userOAuthProvider
 { "grant_type": "refresh_token", "refresh_token": "<...>",
   "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e" }
 ```
-Response is standard OAuth (`access_token`, `refresh_token`, `expires_in`). Refresh
-when `expiresAt <= now`. `client_id` overridable via `CLAUDE_CODE_OAUTH_CLIENT_ID`;
+Response is standard OAuth (`access_token`, `refresh_token`, `expires_in`, and
+`refresh_token_expires_in` when the login has an end). Refresh when
+`expiresAt <= now`. 2.1.322's own login refresh also sends `scope`
+(space-separated) in that body. `client_id` overridable via `CLAUDE_CODE_OAUTH_CLIENT_ID`;
 bare token via `CLAUDE_CODE_OAUTH_TOKEN`.
 
 ### 2.2 Mode B — Managed Agents (API key)

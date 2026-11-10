@@ -68,6 +68,11 @@ TRUSTED_DEVICES_PATH = "/api/auth/trusted_devices"
 _ENROLLED_AFTER_REFUSAL = "trustedDeviceEnrolledAfterRefusalAtMs"
 _REFUSAL_ENROLL_COOLDOWN_MS = 24 * 3600 * 1000
 
+# The CLI's bounds on a `refreshTokenExpiresAt` worth keeping: an epoch-ms time
+# from 2025 on and at most ten years ahead.
+_LOGIN_END_MIN_MS = 1735689600000
+_LOGIN_END_MAX_AHEAD_MS = 3650 * 24 * 3600 * 1000
+
 # Environment overrides (handy in CI / other machines).
 ENV_ACCESS_TOKEN = "CLAUDE_RC_ACCESS_TOKEN"
 ENV_ORG_UUID = "CLAUDE_RC_ORG_UUID"
@@ -364,6 +369,8 @@ def refresh_credentials(
             f"token refresh failed: HTTP {resp.status_code} {resp.text[:200]}"
         )
     body = resp.json()
+    lifetime = body.get("refresh_token_expires_in")
+    login_ends_ms = _now_ms() + int(lifetime * 1000) if _is_number(lifetime) else None
     new = OAuthCredentials(
         access_token=body["access_token"],
         refresh_token=body.get("refresh_token", creds.refresh_token),
@@ -384,7 +391,7 @@ def refresh_credentials(
     if persist:
         try:
             # Like the CLI's compare-and-swap, which also takes a "" it cleared.
-            _persist(new, held=(creds.refresh_token, "", *behind))
+            _persist(new, held=(creds.refresh_token, "", *behind), login_ends_ms=login_ends_ms)
             new.stale_refresh_token = None
         except CredentialsError as exc:  # never raise here: `new` is the only valid pair
             _log.warning("refreshed tokens kept in memory only: %s", exc)
@@ -408,21 +415,38 @@ def _stored_login(creds: OAuthCredentials, held: tuple) -> Optional[dict]:
     return data
 
 
-def _persist(creds: OAuthCredentials, *, held: tuple) -> None:
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _login_end(value: object) -> Optional[float]:
+    """``value`` if it is a ``refreshTokenExpiresAt`` the CLI would keep."""
+    if _is_number(value) and _LOGIN_END_MIN_MS <= value <= _now_ms() + _LOGIN_END_MAX_AHEAD_MS:
+        return value
+    return None
+
+
+def _persist(creds: OAuthCredentials, *, held: tuple, login_ends_ms: Optional[int] = None) -> None:
     """Write refreshed tokens back to the store they came from, the way the
     CLI's refresh saves: a compare-and-swap that writes only while the stored
     login's refresh token is one of ``held`` (the one just spent, or what the
     store was left with). Only the token fields change; the block's other
     fields (``subscriptionType``, ``rateLimitTier`` …) and the document's
-    other keys (``mcpOAuth`` …) stay as stored."""
+    other keys (``mcpOAuth`` …) stay as stored.
+
+    ``refreshTokenExpiresAt`` is when the login as a whole ends (the CLI warns
+    as it nears). A refresh never moves it later: the stored time stays, or
+    drops to ``login_ends_ms`` (the response's ``refresh_token_expires_in``)
+    when that is sooner. A stored value the CLI wouldn't trust is removed."""
     data = _stored_login(creds, held)
     if data is None:
         return
     block = data["claudeAiOauth"]
-    if block.get("refreshToken") != creds.refresh_token:
-        # It described the refresh token we just spent — drop it rather
-        # than leave a stale expiry next to the new token.
+    stored_end = _login_end(block.get("refreshTokenExpiresAt"))
+    if stored_end is None:
         block.pop("refreshTokenExpiresAt", None)
+    else:
+        block["refreshTokenExpiresAt"] = min(stored_end, _login_end(login_ends_ms) or stored_end)
     block.update(
         accessToken=creds.access_token,
         refreshToken=creds.refresh_token,
