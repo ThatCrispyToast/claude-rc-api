@@ -66,7 +66,7 @@ and the Trusted Devices token with the CLI's `CLAUDE_TRUSTED_DEVICE_TOKEN`.
 
 ```bash
 claude-rc whoami                 # login / org / token status
-claude-rc list                   # your Remote Control sessions
+claude-rc list                   # your active sessions (--all adds archived, --pinned filters)
 claude-rc get   <cse_id>         # session details (JSON)
 claude-rc events <cse_id>        # recent history
 claude-rc watch <cse_id>         # stream live (read-only)
@@ -75,6 +75,7 @@ claude-rc ask   <cse_id> "what are you stuck on?"  # side question
 claude-rc send  <cse_id> "run the tests"   # send a message, print the reply
 claude-rc repl  <cse_id>         # interactive chat
 claude-rc rename <cse_id> "new title"
+claude-rc pin   <cse_id>         # pin it in claude.ai/code's sidebar (unpin undoes it)
 claude-rc web                    # browser control panel (all sessions)
 ```
 
@@ -84,9 +85,10 @@ interrupting a running turn or adding to the transcript (it costs a model call).
 ## Web UI
 
 A dependency-free browser control panel for your Remote Control sessions: list
-them (with each one's effort, context use, and status summary), watch the live
-event stream, send messages, ask side questions, allow or deny tool
-permissions, and steer (interrupt / model / permission mode / effort / archive).
+them (pins first, with each one's effort, context use, and status summary; tick
+*archived* to include those), watch the live event stream, send messages, ask
+side questions, allow or deny tool permissions, and steer (interrupt / model /
+permission mode / effort / pin / archive and unarchive).
 
 ```bash
 claude-rc web                    # serves http://127.0.0.1:8765 and opens it
@@ -111,12 +113,12 @@ from claude_rc import RemoteControlClient
 
 rc = RemoteControlClient()                 # reads ~/.claude, refreshes token as needed
 
-# discover sessions
-for s in rc.sessions():
+# discover sessions (a page is the 20 newest, archived included, unless filtered)
+for s in rc.sessions(statuses="active"):
     meta = s.get("external_metadata") or {}
     print(s["id"], s["worker_status"], s["title"], meta.get("effort_level"))
 
-sid = rc.sessions()[0]["id"]
+sid = rc.sessions(statuses="active")[0]["id"]
 
 # ask and wait for the answer (sends, streams from the pre-send cursor, stops on `result`)
 for ev in rc.send_and_collect(sid, "summarize the current diff", print_stream=True):
@@ -135,6 +137,14 @@ rc.set_model(sid, "claude-opus-5-5")
 rc.set_permission_mode(sid, "acceptEdits")
 rc.set_effort(sid, "high", wait=6.0)        # low|medium|high|xhigh|max, or None = auto
 rc.rename_session(sid, "release prep")
+rc.pin_session(sid)                         # claude.ai/code's Pinned group; unpin_session undoes it
+rc.sessions(tags=PINNED_TAG)                # the pins (from claude_rc import PINNED_TAG)
+rc.archive_session(sid); rc.unarchive_session(sid)
+
+# follow the session list instead of polling it
+page = rc.list_sessions(statuses="active")
+for kind, s in rc.watch_sessions(resume_token=page["resume_token"]):
+    print(kind, s["id"], s["worker_status"], s["title"])   # kind: added | changed
 
 # answer the worker's prompts
 for ev in rc.stream_events(sid):
@@ -142,6 +152,8 @@ for ev in rc.stream_events(sid):
         req = ev.payload["request"]
         rc.respond_permission(sid, ev.request_id, allow=True,
                               tool_input=req["input"], tool_use_id=req.get("tool_use_id"))
+        break
+    if ev.settles_prompt:                   # someone else answered ev.request_id, or the worker withdrew it
         break
 
 # ask the worker — each waits for its verdict (ControlRejected / ControlTimeout)
@@ -164,7 +176,8 @@ rc.request_control(sid, "mcp_status")
 The session object already carries the cheap answers, no round trip needed:
 `external_metadata` has `effort_level`, `context_usage` (`used_tokens` /
 `max_tokens`), `post_turn_summary` (a one-line `status_detail`, plus
-`needs_action` when it waits on you) and the worker's `container_cc_version`.
+`needs_action` when it waits on you) and the worker's `container_cc_version`,
+and `tags` holds `ui:pinned` for a pinned session.
 
 Cloud (Managed Agents) mode:
 
@@ -200,16 +213,19 @@ ev.sequence_num  # RC ordering/resume cursor (int)
 ev.source        # "client" (a controller) | "worker" (Claude Code)
 ev.is_turn_end   # a `result` (RC) or `session.status_idle` (managed agents)
 ev.is_blocking_control  # a worker prompt waiting on you (never a controller's own request)
-ev.request_id    # the id a control_request carries / a control_response answers
+ev.settles_prompt  # that prompt is over: a controller answered it, or the worker withdrew it
+ev.request_id    # the id a control_request carries / a control_response answers / a cancel withdraws
 ev.worker_state  # system/init|status → {model, effort, permission_mode, claude_code_version}
 ev.attestation   # "UNSPECIFIED" | "VERIFIED" | "ABSENT" … (Trusted Devices)
 ```
 
 ## Safety
 
-- `list`/`get`/`events`/`watch` and the `RemoteControlClient` read methods are
-  read-only. `send`/`repl`/`send_message`/`interrupt` and the other steering
-  calls inject into a live session, so only use them on sessions you own. The
+- `list`/`get`/`events`/`watch` and the `RemoteControlClient` read methods
+  (`watch_sessions` included) are read-only. `send`/`repl`/`send_message`/
+  `interrupt` and the other steering calls inject into a live session, so only
+  use them on sessions you own. `rename`, `pin` and `archive` change what every
+  controller's list shows. The
   worker queries (`ask`, `info`, `side_question`, `get_*`) leave a
   `control_request` / `control_response` pair in the event log, as claude.ai's
   own attach does; a side question also costs a model call.

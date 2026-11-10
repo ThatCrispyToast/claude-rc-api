@@ -1,7 +1,7 @@
 # Claude Remote Control API — Reverse-Engineered Reference
 
 > **Unofficial.** Reconstructed from the Claude Code CLI (a Bun single-file
-> executable; last mined at 2.1.301) and the API docs it embeds. These are private
+> executable; last mined at 2.1.322) and the API docs it embeds. These are private
 > endpoints used by `claude.ai/code` and the Claude mobile apps. They are not a
 > supported public interface and can change without notice. The list/read paths
 > here were exercised against the live API; write/steer paths are documented from
@@ -103,9 +103,12 @@ pair), logs a warning, and sets `stale_refresh_token` to the spent token the
 store still holds. Until a later refresh saves over it, the client doesn't
 reload that stale pair, or the `""` the CLI clears it to.
 
-**Organization UUID** (needed for the `x-organization-uuid` header) lives in
+**Organization UUID** (the `x-organization-uuid` header) lives in
 **`~/.claude.json`** → `oauthAccount.organizationUuid` (a top-level
-`organizationUuid` in `.credentials.json` is used as a fallback).
+`organizationUuid` in `.credentials.json` is used as a fallback). `/v1/code/*`
+answers without the header (list, get and events checked live 2026-11-10; the
+CLI's get / update / archive calls send it only on the `/v1/sessions` compat
+path), so a missing UUID is not fatal.
 
 **Request headers** (builder `DC(token)` + `Gnd`/`l$g`):
 ```
@@ -113,7 +116,7 @@ Authorization:              Bearer <accessToken>
 Content-Type:               application/json
 anthropic-version:          2023-06-01                 # the ONLY version string ever sent
 anthropic-client-platform:  web_claude_ai              # LOAD-BEARING on event ingest — see §2.3
-x-organization-uuid:        <organizationUuid>
+x-organization-uuid:        <organizationUuid>         # optional on /v1/code/*
 anthropic-beta:             ccr-byoc-2025-07-29         # only on the CLI's /v1/sessions compat path; /v1/code/* needs none
 X-Trusted-Device-Token:     <token>                    # only if org requires Trusted Devices
 User-Agent:                 claude-code/2.1.207         # any value works
@@ -176,18 +179,20 @@ inbound message). Send `web_claude_ai`.
 Base: `https://api.anthropic.com`. All calls use the Mode-A headers from §2.1.
 `{id}` is a `cse_…` session id. Everything marked *verified* was exercised live
 against Claude Code **2.1.301** workers on 2026-10-16; the rest is read from the
-binary.
+binary. Rechecked against **2.1.322** on 2026-11-10: the worker's dispatch table
+(§3.2) is unchanged, and what is new is dated where it appears.
 
 ### 3.1 Sessions
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/v1/code/sessions` | List your sessions, newest first — `?limit`, `?cursor=<next_cursor>` |
+| `GET` | `/v1/code/sessions` | List your sessions, newest first — `?limit`, `?cursor=<next_cursor>`, and the filters below |
+| `GET` | `/v1/code/sessions/watch` | SSE stream of changes to that list (below) |
 | `GET` | `/v1/code/sessions/{id}` | Get one — **wrapped**: `{"response_shape": {…session…}}` |
 | `PUT` | `/v1/code/sessions/{id}` | Update `{"title"}` or `{"add_tags", "remove_tags"}` → `{"session": {…}}` (verified; the CLI's own title/colour sync) |
 | `POST` | `/v1/code/sessions/{id}/archive` | Archive/end (empty body `{}`; **200 or 409** = success) |
-| `POST` | `/v1/code/sessions/{id}/unarchive` | Unarchive (in the 2.1.301 client; wants an elevated-auth / trusted device — unverified) |
-| `POST` | `/v1/code/sessions/{id}/mark_read` | Mark read (optional `{sequence_num}`) |
+| `POST` | `/v1/code/sessions/{id}/unarchive` | Back to `active` → `{"session": {…}}`; **409** `invalid_status_transition` when it wasn't archived (verified 2026-11-10). The CLI expects a 403 `untrusted_device` / `session_stale_relogin` here from orgs that want elevated auth |
+| `POST` | `/v1/code/sessions/{id}/mark_read` | Clear `unread` → `{"unread": false}`; optional `{event_id}` (an event's UUID, what the CLI sends) names the last one read. A `sequence_num` field is ignored |
 | `POST` | `/v1/code/sessions/{id}/client/presence` | Announce/clear a watching client |
 
 There is **no DELETE** for code sessions — archive only. Session **creation** is done
@@ -196,6 +201,36 @@ by the local CLI, not the controller (see §5). A list page is
 only the single-session `GET` wraps its object in `response_shape`, with or
 without `anthropic-beta` (checked live 2026-10-28). `get_session()` and
 `update_session()` return the session itself.
+
+**List filters** (verified 2026-11-10). A page holds `limit` sessions: 20 by
+default, 200 at most, archived ones included. Repeat a parameter to give several
+values (a comma-joined value is read as one):
+
+| Parameter | Keeps |
+|---|---|
+| `statuses` | sessions in that `status` (`active`, `archived`) |
+| `tags` | sessions carrying **any** of the tags |
+| `exclude_tags` | sessions without the tag |
+
+Unknown parameters are ignored, so a misspelt filter returns the unfiltered list.
+
+**Watching the list** (verified 2026-11-10; the CLI's bridge uses it to learn
+when to poll for work). `GET /v1/code/sessions/watch` with
+`Accept: text/event-stream` and `Last-Event-ID: <resume_token>`, the token a
+list page returned (the CLI mints one with `?limit=1`, and adds
+`?include_trigger_sessions=true&exclude_tags=-`). Without a token it answers
+`400 resume_token required — call ListSessions first`. Frames:
+- `sync` — the stream is caught up; its `id:` is a newer resume token. One
+  arrives at connect, and the CLI redials a stream that goes 6–9 minutes
+  without another.
+- `added` / `changed` — data is the whole session object. `added` was the first
+  frame for a session on a watch, whether the session was new or had just
+  changed for the first time since the token; later changes came as `changed`.
+- `:keepalive` comments about every 13 s. The CLI redials a stream silent for 45 s.
+
+As the CLI reads the refusals: `410` means the token is too old to resume from
+(list again), `404` that the account isn't offered the stream, and `429`
+carries `retry-after`.
 
 **Session object** (verified):
 ```json
@@ -210,8 +245,10 @@ without `anthropic-beta` (checked live 2026-10-28). `get_session()` and
   "config": { "model": "claude-opus-5-5", "origin": "claude_code_cli", "mcp_connector_ids": [], … },
   "created_at": "2026-10-16T15:25:49.307782Z",
   "last_event_at": "2026-10-16T15:53:22.309103Z",
+  "updated_at": "2026-10-16T15:53:22.309103Z",
+  "environment_id": "",               // empty for a bridge session
   "user_message_count": "0",
-  "tags": ["remote-control-repl", "config:auto-create-pr:off"],
+  "tags": ["remote-control-repl", "config:auto-create-pr:off", "ui:pinned"],  // "ui:pinned" = pinned in claude.ai/code
   "unread": true,
   "external_metadata": {
     "container_cc_version": "2.1.301",          // the worker's Claude Code version
@@ -233,6 +270,11 @@ without `anthropic-beta` (checked live 2026-10-28). `get_session()` and
   "participants": [], "relations": []
 }
 ```
+The single-session `GET` adds `security_tier` (`standard` | `elevated`),
+`session_url` (its claude.ai page), `metadata`, `requires_action_details_list`
+and `client_presence`: who is watching, as
+`[{client_id, last_pulse_at, platform}]` (verified 2026-11-10).
+
 `requires_action` on `worker_status` means the agent is blocked on you (a
 permission prompt or dialog); details live in `external_metadata.pending_action`.
 The session has **no permission-mode field** — read it from the `system/init` /
@@ -240,7 +282,25 @@ The session has **no permission-mode field** — read it from the `system/init` 
 latter keeps values the worker refused).
 
 **`POST …/client/presence`** — body `{client_id, connected_at}` (ISO-8601) to
-announce, or `{client_id, clear:true}` to leave. The web client pulses this.
+announce, or `{client_id, clear:true}` to leave. The web client pulses this, and
+each pulse shows in the session's `client_presence`.
+
+**Pinned sessions** carry the tag **`ui:pinned`** (verified 2026-11-10: adding
+it through `PUT …/{id}` with `{"add_tags": ["ui:pinned"]}` moved a session into
+claude.ai/code's *Pinned* group, and `remove_tags` took it back out). So
+`?tags=ui:pinned` lists the pins, and `pin_session()` / `unpin_session()` set
+them. Archived sessions keep the tag.
+
+claude.ai also keeps a per-user settings document this library can't reach, since
+it **refuses OAuth tokens** (`403 permission_error`, `error_code:
+oauth_token_not_accepted`, on both `api.anthropic.com` and `claude.ai`, checked
+2026-10-30): `GET` / `PUT /api/claude_code/organizations/{org}/user_settings`,
+`{userId, version, lastModified, checksum, content: {entries}}`, written one key
+at a time with `If-Match`. Its key `ccd/dframe-starred-code` held a `starredIds`
+list of `session_…` ids that matched the pins on that date; other keys seen were
+`ccd/dframe-starred-cowork-remote` and `ccd/dframe-store` (sidebar state). The
+Claude Code CLI has no client for it (`/api/claude_code/settings` is org-managed
+policy, not this).
 
 ### 3.2 Sending events (steering)
 
@@ -253,6 +313,9 @@ Each event is wrapped in `payload`, and the client adds a `uuid` if the payload
 lacks one. The ack (verified) is
 `{"results": [{"event_id", "sequence_num", "duplicate"}], "attestation_feedback": null}`
 — `sequence_num` is the event's place in the log, a ready cursor for §3.3.
+The CLI's own controller reads two refusals here: `409` with
+`error.type: session_not_active`, and `413` (or a `400` naming
+`remote_tool_result_too_large`) for an event too big to store.
 There is also a separate outbound channel `POST …/{id}/teleport-events`
 (screen-mirroring) — not needed for steering.
 
@@ -264,24 +327,28 @@ There is also a separate outbound channel `POST …/{id}/teleport-events`
 ```
 `content` accepts the full Messages-API block union: `text`,
 `image` (`{source:{type:"base64",media_type,data}}`), `tool_result`, plus file
-attachments. A message sent while a turn runs queues behind it.
+attachments. A message sent while a turn runs waits in the worker's queue, and
+is usually folded into that turn rather than starting the next (§3.3, `result`).
 
 **Steer and query via `control_request`** — payload
 `{type:"control_request", request_id, request:{subtype, ...}}`. The POST only
 queues it: the worker's verdict arrives later as a `control_response`
-(`response: {subtype: success|error, request_id, response?, error?}`) in the
-event log. **The 2.1.301 remote-control (REPL) worker's dispatch table** (each
-verified live unless noted):
+(`response: {subtype: success|error, request_id, response?, error?, error_code?}`)
+in the event log, with `source: "worker"`. An error may name its kind in
+`error_code` (`workspace_diff_pending`, `invalid_mode`, `internal_error` …),
+which `ControlRejected.error_code` carries. **The remote-control (REPL)
+worker's dispatch table** (2.1.301, the same subtypes in 2.1.322; each verified
+live unless noted):
 
 | `request.subtype` | fields | verdict `response` / notes |
 |---|---|---|
 | `initialize` | `supportedDialogKinds?` | `{claude_code_version, current_model, current_permission_mode, commands, agents, models, pid, inbound_read_receipts, …}`, with `pending_permission_requests` / `pending_user_dialog_requests` beside it. claude.ai sends it on every attach (often twice) and the worker answers each with a fresh `system/init`. |
 | `interrupt` | — | stops the running turn (jumps the queue) |
-| `set_model` | `model` (`null`/`"default"` = default) | may post `system/informational` notices; `only_if_model_is_current` is refused over RC |
+| `set_model` | `model` (`null`/`"default"` = default) | may post `system/informational` notices, and a success may carry `{model}` (2.1.322); `only_if_model_is_current` is refused over RC |
 | `set_permission_mode` | `mode` (`default` \| `plan` \| `acceptEdits` \| `bypassPermissions`) | |
 | `apply_flag_settings` | `settings: {effortLevel?, ultracode?}` — nothing else over RC | `effortLevel` ∈ `low` `medium` `high` `xhigh` `max`, `null` = auto; anything else → `"unrecognized effortLevel"`. **Session-scoped**: re-emits `system/init` with the new `effort`, persists nothing. This is how the CLI's `/effort` reaches a worker — there is no `set_effort` subtype. ⚠️ Refused by RC workers through at least 2.1.212 (`"REPL bridge does not handle…"`); `RemoteControlClient.set_effort()` falls back to the `/effort` slash command there. |
 | `set_max_thinking_tokens` | `max_thinking_tokens` (int \| null), `thinking_display?` | unverified |
-| `side_question` | `question`, `history?: [{question, response}]` | `{response: string \| null, synthetic: bool}` — claude.ai's "btw": answered from the conversation without interrupting the turn or entering the transcript (one model call; ~2–3 s on Haiku). `null` = nothing to answer from (empty conversation); `synthetic: true` carries a canned "(No answer available…)". Progress posts as `system/control_request_progress`; 11-minute deadline; `control_cancel_request` ends it with error `"Side question cancelled"`. |
+| `side_question` | `question`, `history?: [{question, response, fallback_notice?}]` | `{response: string \| null, synthetic: bool}` — claude.ai's "btw": answered from the conversation without interrupting the turn or entering the transcript (one model call; ~2–3 s on Haiku). `null` = nothing to answer from (empty conversation); `synthetic: true` carries a canned "(No answer available…)". Progress posts as `system/control_request_progress`; 11-minute deadline; `control_cancel_request` ends it with error `"Side question cancelled"`. |
 | `cancel_async_message` | `message_uuid` | `{cancelled: bool}` — withdraws a controller's queued user message (its payload `uuid`); `false` once a turn picked it up |
 | `stop_task` | `task_id` | `{}` — the task posts `task_updated` (`killed`) → `task_notification` (`stopped`); unknown ids are acked too |
 | `background_tasks` | `tool_use_id?` | backgrounds the running foreground shell task (`{backgrounded}`), or all of them — unverified |
@@ -295,7 +362,11 @@ verified live unless noted):
 | `mcp_authenticate`, `mcp_oauth_callback_url`, `mcp_reconnect`, `mcp_set_servers` | | MCP management; claude.ai's `mcp_set_servers` (server-injected MCP) is refused on RC sessions |
 | `fork_conversation` | | `{forked: false, reason: "requires_remote_control_server"}` on a plain RC worker |
 
-Anything else gets `"REPL bridge does not handle control_request subtype: …"`.
+Anything else gets `"REPL bridge does not handle control_request subtype: …"`:
+claude.ai's `rewind_conversation` (`target_message_uuid`,
+`last_seen_user_message_uuid`) is one, seen refused by a 2.1.318 worker.
+claude.ai also sends `end_session` with `reason: "archived"`; the logs hold no
+verdict for it.
 A process that is shutting down refuses everything but the read-only queries.
 To withdraw an in-flight request, send `{type:"control_cancel_request", request_id}`.
 
@@ -312,8 +383,15 @@ or `{"behavior": "deny", "message": "…"}`. `updatedInput` is optional in the
 **AskUserQuestion arrives as `can_use_tool`**, not a dialog: answer it with an
 allow whose `updatedInput` is the tool's input plus
 `answers: {<question text>: <label | [labels]>}` (an empty map dismisses it; the
-tool crashes if `questions` is missing). Any controller's answer echoes back as a
-`control_response`, so every controller sees a prompt resolve.
+tool crashes if `questions` is missing). claude.ai's own allow carries
+`toolUseID` and `tool_name` inside that decision, next to `updatedInput`.
+
+A prompt ends one of three ways, and a controller should watch for each: any
+controller's answer echoes back as a `control_response` (`source: "client"`);
+the worker withdraws it with a `control_cancel_request` naming the prompt's
+`request_id` (`source: "worker"`: it was answered at the terminal, or the turn
+moved on); or the turn's `result` arrives. `Event.settles_prompt` is true for
+the first two.
 
 **Slash commands work as user messages** (confirmed live, 2026-07-17): a `user`
 event whose text is e.g. `/context` is executed by the remote-control worker
@@ -336,6 +414,8 @@ of the command output. Semantics are exactly "typed at that terminal" — so
 - Replays every persisted event after `N` (**exclusive**; `0` replays the whole
   backlog), then follows live. Reconnect with **both** `?from_sequence_num=<last>`
   **and** a `Last-Event-ID: <last>` header and de-dupe by `sequence_num`.
+- `&control_only=1` narrows it to the control protocol: `control_request` and
+  `control_response` events only (verified 2026-11-10).
 - Frame kinds (`event:` line):
   - `client_event` — a persisted event; `id: <sequence_num>`, data = the envelope.
   - `ephemeral_event` — never persisted, no sequence number: `stream_event`
@@ -345,7 +425,11 @@ of the command output. Semantics are exactly "typed at that terminal" — so
     `DELIVERY_STATUS_RECEIVED` → `…_PROCESSING` (it left the queue for a turn)
     → `…_PROCESSED` (the turn ended).
   - `catch_up_truncated` — a history gap.
-- Comment lines (`:keepalive`) are heartbeats.
+  - `security_update` — `{security_tier}`, e.g. `elevated` (2.1.322, from the
+    binary).
+- Comment lines (`:keepalive`) are heartbeats: one at connect, then about every
+  15 s, on an archived session's stream too. The CLI redials a stream that has
+  been silent for 45 s, and so does `stream_events()`.
 
 **Poll (history):** `GET /v1/code/sessions/{id}/events?limit=N&sort_order=desc&cursor=C`
 - `sort_order=asc` starts at the session's **first** event, `desc` at its newest
@@ -365,12 +449,15 @@ of the command output. Semantics are exactly "typed at that terminal" — so
 | `system` / `background_tasks_changed` | `tasks: [{task_id, task_type, description, run_id}]` — the running background set |
 | `system` / `control_request_progress` | a long control (side question) working: `request_id`, `status` |
 | `system` / `informational` | a notice (`content`, `level`) |
+| `system` / `vcs_state_changed` | the worker's repo moved: `cwd`, `kind` (`push` …) |
+| `system` / `worker_shutting_down` | the Claude Code process is exiting (`reason: host_exit`); a `result` followed it in the logs |
 | `user` | a user turn — `{message:{role:"user", content:[...]}}` (sends, echoes, tool results) |
 | `assistant` | assistant turn — `{message:{role:"assistant", content:[text\|thinking\|tool_use...]}}` |
-| `result` | **turn complete** — `{subtype: success\|error_max_turns\|error_during_execution, is_error, num_turns, duration_ms, total_cost_usd, usage, stop_reason}` |
+| `result` | **turn complete** — `{subtype: success\|error_max_turns\|error_during_execution, is_error, num_turns, duration_ms, total_cost_usd, usage, stop_reason, terminal_reason, user_message_uuid}`. `user_message_uuid`, when present, is the `uuid` of the user message that started the turn; a message sent mid-turn usually joins the running turn instead of getting a `result` of its own |
 | `stream_event` | partial streaming (ephemeral) |
-| `control_request` / `control_response` | the control protocol (§3.2), from either side — `source` says whose |
-| `rate_limit_event`, `tool_progress`, `tool_use_summary`, `conversation_reset`, `active_goal`, `auth_status`, `env_manager_log` | auxiliary UI/telemetry events |
+| `control_request` / `control_response` / `control_cancel_request` | the control protocol (§3.2), from either side — `source` says whose |
+| `conversation_reset` | `/clear` and its kin (`trigger: clear`, `new_conversation_id`): the events before it are no longer the conversation |
+| `rate_limit_event`, `tool_progress`, `tool_use_summary`, `active_goal`, `auth_status`, `env_manager_log` | auxiliary UI/telemetry events |
 
 A turn ends on a **`result`** event (not `session.status_idle` — that's mode B).
 
@@ -393,7 +480,9 @@ controls), and posts an assistant notice: *"Remote Control ignored a message tha
 arrived without a valid device signature (attestation: ABSENT). Re-pair the
 sending device in Trusted Devices."* This library does not sign (it does send
 `X-Trusted-Device-Token` when the credentials store has one); the send ack's
-`attestation_feedback` is where the server would say more.
+`attestation_feedback` is where the server would say more. A signing client
+(2.1.322, from the binary) posts each event as
+`{"payload": {…}, "device_attestation": {…}}`.
 
 **Enrollment** (2.1.312): `POST /api/auth/trusted_devices` on
 `api.anthropic.com` with the OAuth bearer and
