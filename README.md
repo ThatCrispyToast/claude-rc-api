@@ -146,6 +146,10 @@ rc.send_message(sid, "actually, run the linter too", message_uuid=mid)
 rc.cancel_queued_message(sid, mid)    # True while it was still queued
 ```
 
+Relaying a stream? `stream_events(sid, keepalives=True)` also yields the
+server's heartbeat (every ~15 s) as a `keepalive` event: write your own, and
+stop when your reader has gone.
+
 ### Prompts
 
 ```python

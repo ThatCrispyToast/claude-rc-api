@@ -429,7 +429,9 @@ of the command output. Semantics are exactly "typed at that terminal" — so
     binary).
 - Comment lines (`:keepalive`) are heartbeats: one at connect, then about every
   15 s, on an archived session's stream too. The CLI redials a stream that has
-  been silent for 45 s, and so does `stream_events()`.
+  been silent for 45 s, and so does `stream_events()`. With `keepalives=True`
+  it also yields each one as an event of type `keepalive`, which gives a caller
+  relaying the stream a regular turn to check its own reader is still there.
 
 **Poll (history):** `GET /v1/code/sessions/{id}/events?limit=N&sort_order=desc&cursor=C`
 - `sort_order=asc` starts at the session's **first** event, `desc` at its newest

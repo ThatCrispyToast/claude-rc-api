@@ -46,6 +46,7 @@ class RC:
     RATE_LIMIT_EVENT = "rate_limit_event"
     CONVERSATION_RESET = "conversation_reset"  # /clear and friends: what came before is no longer the conversation
     CATCH_UP_TRUNCATED = "catch_up_truncated"  # stream only: the replay skipped part of the history
+    KEEPALIVE = "keepalive"  # stream only, on request: the server's heartbeat (stream_events(keepalives=True))
 
 
 class RCSystem:

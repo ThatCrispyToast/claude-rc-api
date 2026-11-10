@@ -31,6 +31,8 @@ def test_sse_multiline_data_and_heartbeat():
     assert len(frames) == 1
     assert frames[0].data == "line1\nline2"
     assert frames[0].event is None
+    # asked for, the comment comes through as an empty frame
+    assert [f.is_heartbeat for f in parse_sse(lines, heartbeats=True)] == [False, True]
 
 
 def test_sse_strips_single_leading_space():
@@ -1409,6 +1411,19 @@ def test_stream_skips_the_frames_that_are_not_events(monkeypatch):
         ("control_request", 7), ("stream_event", None), ("catch_up_truncated", None)]
     assert events[2].payload["dropped"] == 3
     assert seen == [{"from_sequence_num": "5", "control_only": "1"}]
+    rc._http.close()
+
+
+def test_stream_passes_keepalives_on_only_when_asked(monkeypatch):
+    import httpx
+
+    def handler(req):
+        return httpx.Response(200, text=_sse(_client_event(1, {"type": "assistant"})) + ":keepalive\n\n")
+
+    rc = _stream_rc(handler, monkeypatch)
+    assert [e.type for e in rc.stream_events("cse_x", reconnect=False)] == ["assistant"]
+    events = list(rc.stream_events("cse_x", reconnect=False, keepalives=True))
+    assert [(e.type, e.sequence_num) for e in events] == [("keepalive", None), ("assistant", 1), ("keepalive", None)]
     rc._http.close()
 
 

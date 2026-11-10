@@ -4,7 +4,7 @@ Works over any iterator of decoded text lines (e.g. ``httpx.Response.iter_lines(
 Yields one :class:`SSEFrame` per event block. Enough of the SSE spec is
 implemented for the Anthropic sessions stream: ``event:``, ``data:`` (possibly
 multi-line, joined with ``\\n``), ``id:`` and ``retry:``; comment lines starting
-with ``:`` are ignored (they are used as heartbeats).
+with ``:`` are heartbeats, ignored unless the caller asks for them.
 """
 
 from __future__ import annotations
@@ -25,8 +25,9 @@ class SSEFrame:
         return not self.event and not self.data
 
 
-def parse_sse(lines: Iterable[str]) -> Iterator[SSEFrame]:
-    """Turn a stream of text lines into SSE frames."""
+def parse_sse(lines: Iterable[str], *, heartbeats: bool = False) -> Iterator[SSEFrame]:
+    """Turn a stream of text lines into SSE frames. With ``heartbeats``, each
+    comment line also comes through, as an empty frame (``is_heartbeat``)."""
     event: Optional[str] = None
     data: list[str] = []
     ident: Optional[str] = None
@@ -44,7 +45,9 @@ def parse_sse(lines: Iterable[str]) -> Iterator[SSEFrame]:
             continue
 
         if line.startswith(":"):
-            # Comment / heartbeat line — ignore.
+            # Comment / heartbeat line.
+            if heartbeats:
+                yield SSEFrame(event=None, data="")
             continue
 
         field, _, value = line.partition(":")

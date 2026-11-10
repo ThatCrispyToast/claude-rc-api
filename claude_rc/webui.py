@@ -53,7 +53,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .client import APIError, ControlRejected, ControlTimeout, RemoteControlClient
 from .credentials import CredentialsError, load_credentials, load_org_uuid
-from .events import Event
+from .events import RC, Event
 
 _STATIC = Path(__file__).parent / "static"
 _PAGE = _STATIC / "index.html"
@@ -326,7 +326,13 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
         try:
-            for ev in self.rc.stream_events(sid, from_sequence_num=from_seq):
+            # Keepalives pass through as SSE comments: writing one is how a
+            # quiet session's stream finds out that its browser tab has gone.
+            for ev in self.rc.stream_events(sid, from_sequence_num=from_seq, keepalives=True):
+                if ev.type == RC.KEEPALIVE:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    continue
                 data = json.dumps(event_to_dict(ev))
                 out = ""
                 if ev.sequence_num is not None:

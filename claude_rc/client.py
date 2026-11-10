@@ -805,6 +805,7 @@ class RemoteControlClient:
         *,
         reconnect: bool,
         max_reconnects: int,
+        heartbeats: bool = False,
     ) -> Iterator[SSEFrame]:
         """The frames of one of the API's SSE streams, redialled as needed.
 
@@ -813,7 +814,9 @@ class RemoteControlClient:
         silent connection redials with exponential backoff (``reconnect``),
         and so does one the server closes. A connect refused for want of a
         trusted device redials at once, ``reconnect`` or not, when a new device
-        token is in hand; any other refusal raises :class:`APIError`.
+        token is in hand; any other refusal raises :class:`APIError`. With
+        ``heartbeats`` the server's keepalive comments come through too, as
+        empty frames.
         """
         attempts = 0
         while True:
@@ -830,9 +833,7 @@ class RemoteControlClient:
                             continue  # redial with the new trusted-device token
                         raise APIError(resp.status_code, body, resp.headers.get("request-id"))
                     attempts = 0
-                    for frame in parse_sse(resp.iter_lines()):
-                        if not frame.is_heartbeat:
-                            yield frame
+                    yield from parse_sse(resp.iter_lines(), heartbeats=heartbeats)
             except httpx.HTTPError:
                 if not reconnect or attempts >= max_reconnects:
                     raise
@@ -849,6 +850,7 @@ class RemoteControlClient:
         reconnect: bool = True,
         max_reconnects: int = 20,
         control_only: bool = False,
+        keepalives: bool = False,
     ) -> Iterator[Event]:
         """``GET /v1/code/sessions/{id}/events/stream`` — live SSE events.
 
@@ -869,6 +871,13 @@ class RemoteControlClient:
         stream has been silent for 45 s (it sends keepalives about every 15 s).
         A connect refused for want of a trusted device reconnects at once (even
         with ``reconnect=False``) when a new device token is in hand.
+
+        ``keepalives`` passes each of those keepalives on as an event of type
+        ``keepalive``, with nothing else in it. A quiet session's stream
+        otherwise yields nothing for hours, and a caller relaying it (to a
+        browser, say) can't tell its own reader has gone until the next event:
+        with these it gets a turn every 15 s to write a heartbeat of its own,
+        and to stop when that fails.
         """
         seen: set[int] = set()
         last_seq = from_sequence_num
@@ -880,7 +889,13 @@ class RemoteControlClient:
             return params, ({"Last-Event-ID": str(last_seq)} if last_seq else {})
 
         url = self._url(session_id, "events", "stream")
-        for frame in self._sse_frames(url, resume, reconnect=reconnect, max_reconnects=max_reconnects):
+        frames = self._sse_frames(
+            url, resume, reconnect=reconnect, max_reconnects=max_reconnects, heartbeats=keepalives
+        )
+        for frame in frames:
+            if frame.is_heartbeat:
+                yield Event(payload={"type": RC.KEEPALIVE})
+                continue
             # The RC stream marks each frame's sequence_num on the id: line.
             if frame.id:
                 try:
