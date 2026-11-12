@@ -1,9 +1,7 @@
 # claude-rc-api
 
 Unofficial Python client for Claude Code Remote Control, reverse-engineered from
-the Claude Code CLI and exercised against the live API. It lets your own
-programs do what `claude.ai/code` and the Claude mobile app do: list, watch and
-steer the Claude Code sessions running on your machines.
+the Claude Code CLI and exercised against the live API.
 
 It comes as a [library](#library), a [CLI](#cli) and a [web UI](#web-ui). The
 protocol is written up in [`API_REFERENCE.md`](./API_REFERENCE.md).
@@ -12,6 +10,9 @@ protocol is written up in [`API_REFERENCE.md`](./API_REFERENCE.md).
 > Unofficial and unsupported. The endpoints are private (`api.anthropic.com`),
 > reconstructed from the CLI binary, and can change or break at any time. Use
 > your own account, at your own risk.
+
+> [!NOTE]
+> A notable portion of this project is AI-generated. While the relevant code has been appropriately reviewed and tested, you should still operate at your own discretion.
 
 ## Install
 
