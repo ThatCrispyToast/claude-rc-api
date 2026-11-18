@@ -10,11 +10,13 @@ from claude_rc.client import APIError
 from claude_rc.events import (
     Event,
     worker_assistant,
+    worker_compact_boundary,
     worker_control_response,
     worker_init,
     worker_initialize_response,
     worker_permission_request,
     worker_result,
+    worker_status,
     worker_stream_event,
     worker_tool_result,
 )
@@ -231,6 +233,9 @@ def test_a_permission_prompt_parks_the_session_until_answered(api):
     assert parked["requires_action_details"] == {
         "tool_name": "Bash", "action_description": "Run: ls", "raw_command": "ls", "request_id": request_id, "tool_use_id": "t-1"}
     assert parked["external_metadata"]["pending_action"]["input"] == {"command": "ls"}
+    rule = [{"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "ls"}], "behavior": "allow", "destination": "session"}]
+    worker.request_permission("Bash", {"command": "ls"}, tool_use_id="t-2", description="Run: ls", permission_suggestions=rule)
+    assert _sent(calls, "POST", "/worker/events")[-1]["events"][0]["payload"]["request"]["permission_suggestions"] == rule
     worker.report_state("running")  # any other state clears the prompt
     resumed = _sent(calls, "PUT", "/worker")[-1]
     assert resumed["requires_action_details"] is None and resumed["external_metadata"] == {"pending_action": None}
@@ -286,7 +291,20 @@ def test_worker_control_response_and_permission_request_shapes():
     assert worker_control_response("r")["response"] == {"subtype": "success", "request_id": "r", "response": {}}
     prompt = worker_permission_request("r", "Write", {"file_path": "a"}, tool_use_id="t")
     assert prompt["type"] == "control_request" and "description" not in prompt["request"]
+    assert "permission_suggestions" not in prompt["request"]
     assert Event.from_wire({"payload": prompt, "source": "worker"}).is_blocking_control
+    rule = [{"type": "addRules", "rules": [{"toolName": "Write"}], "behavior": "allow", "destination": "session"}]
+    offered = worker_permission_request("r", "Write", {"file_path": "a"}, tool_use_id="t", permission_suggestions=rule)
+    assert offered["request"]["permission_suggestions"] == rule
+
+
+def test_a_compaction_is_a_status_and_a_boundary():
+    assert worker_status("compacting") == {"type": "system", "subtype": "status", "status": "compacting"}
+    assert worker_status(None)["status"] is None
+    assert worker_compact_boundary() == {
+        "type": "system", "subtype": "compact_boundary", "compact_metadata": {"trigger": "auto"}}
+    assert worker_compact_boundary(trigger="manual", pre_tokens=900, post_tokens=100)["compact_metadata"] == {
+        "trigger": "manual", "pre_tokens": 900, "post_tokens": 100}
 
 
 # --- the client's two hosting calls ---------------------------------------------
@@ -309,3 +327,28 @@ def test_create_and_bridge_session_requests(monkeypatch):
     assert seen[1] == ("POST", "https://api.example/v1/code/sessions/cse_new/bridge", {})
     rc.bridge_session("cse_new", expected_epoch=3)
     assert seen[2][2] == {"expected_epoch": 3}
+    rc.create_session("t", cwd="/w", repository="me/project", branch="main")
+    assert seen[3][2]["config"] == {
+        "cwd": "/w",
+        "sources": [{"type": "git_repository", "url": "https://github.com/me/project", "revision": "main"}],
+        "outcomes": [{"type": "git_repository", "git_info": {"type": "github", "repo": "me/project", "branches": []}}]}
+
+
+def test_an_attached_file_is_downloaded_with_the_login(monkeypatch):
+    rc = RemoteControlClient.__new__(RemoteControlClient)
+    rc.base_url = "https://api.example"
+    seen = []
+
+    def fake_request(method, url, **kw):
+        seen.append((method, url))
+        return httpx.Response(404, json={"error": {"type": "not_found_error"}}) if "missing" in url else httpx.Response(200, content=b"bytes")
+
+    monkeypatch.setattr(rc, "_request", fake_request)
+    assert rc.download_file("a/b") == b"bytes"
+    assert seen == [("GET", "https://api.example/api/oauth/files/a%2Fb/content")]  # the id stays one segment
+    with pytest.raises(APIError) as too_long:
+        rc.download_file("a", max_bytes=3)
+    assert too_long.value.status == 413
+    with pytest.raises(APIError) as missing:
+        rc.download_file("missing")
+    assert missing.value.status == 404

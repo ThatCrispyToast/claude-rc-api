@@ -215,6 +215,7 @@ from claude_rc import (RemoteControlClient, RemoteControlWorker, worker_assistan
 
 rc = RemoteControlClient()
 session = rc.create_session("echo")    # listed at once, with no worker yet
+# repository="owner/name", branch="main" files it under that repository in the app
 init = worker_init(model="echo", cwd=os.getcwd())
 
 with RemoteControlWorker(rc, session["id"]) as worker:    # claims the seat, heartbeats
@@ -249,6 +250,11 @@ worker.send(worker_assistant([call], model="echo"), worker_tool_result("t1", "RE
 request_id = worker.request_permission("Bash", {"command": "rm -r build"},
                                        tool_use_id="t2", description="Run: rm -r build")
 # ... the answer arrives through events() as a control_response naming request_id
+# permission_suggestions=[...] adds "Always allow" to the card (API_REFERENCE.md §5.3)
+
+# a file the app attached to a message: it arrives as a reference
+for attached in ev.payload.get("file_attachments") or []:
+    data = rc.download_file(attached["file_uuid"])    # attached["file_name"], ["is_image"]
 
 # a reply as it is written, for whoever is watching
 delta = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hel"}}

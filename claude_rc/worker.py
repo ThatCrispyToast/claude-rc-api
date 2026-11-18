@@ -394,6 +394,7 @@ class RemoteControlWorker:
         description: str,
         request_id: str | None = None,
         raw_command: str | None = None,
+        permission_suggestions: list[dict] | None = None,
     ) -> str:
         """Ask the controllers whether a tool may run: a ``can_use_tool``
         prompt, with the session waiting in ``requires_action``. Returns the
@@ -402,10 +403,15 @@ class RemoteControlWorker:
         ``payload["response"]["response"]`` is ``{behavior: allow | deny, …}``.
         Report that event ``processed`` and the state ``running`` to go on. To
         withdraw the prompt instead, :meth:`send` a
-        :func:`~claude_rc.events.cli_control_cancel_request`."""
+        :func:`~claude_rc.events.cli_control_cancel_request`.
+
+        ``permission_suggestions`` offers standing rules beside the one-off
+        yes (:func:`~claude_rc.events.worker_permission_request`); an answer
+        that took one carries it as ``updatedPermissions``."""
         request_id = request_id or str(uuid.uuid4())
         self.send(worker_permission_request(
-            request_id, tool_name, tool_input, tool_use_id=tool_use_id, description=description
+            request_id, tool_name, tool_input, tool_use_id=tool_use_id, description=description,
+            permission_suggestions=permission_suggestions,
         ))
         action = {
             "tool_name": tool_name,

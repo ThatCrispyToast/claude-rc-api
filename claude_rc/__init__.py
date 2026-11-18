@@ -39,6 +39,7 @@ from .credentials import (
     refresh_credentials,
 )
 from .events import (
+    CLAUDE_CODE_VERSION,
     Event,
     RC,
     RCSystem,
@@ -59,6 +60,8 @@ from .events import (
     worker_result,
     worker_control_response,
     worker_permission_request,
+    worker_status,
+    worker_compact_boundary,
     user_message,
     interrupt,
     custom_tool_result,
@@ -83,6 +86,7 @@ __all__ = [
     "load_credentials",
     "load_org_uuid",
     "refresh_credentials",
+    "CLAUDE_CODE_VERSION",
     "Event",
     "RC",
     "RCSystem",
@@ -103,6 +107,8 @@ __all__ = [
     "worker_result",
     "worker_control_response",
     "worker_permission_request",
+    "worker_status",
+    "worker_compact_boundary",
     "user_message",
     "interrupt",
     "custom_tool_result",

@@ -555,10 +555,17 @@ def worker_permission_request(
     tool_use_id: str,
     description: str | None = None,
     display_name: str | None = None,
+    permission_suggestions: list[dict] | None = None,
 ) -> dict:
     """A ``can_use_tool`` prompt: the worker asking its controllers whether a
     tool may run. Their answer comes back as a ``control_response`` naming
-    ``request_id`` (see :func:`cli_permission_response` for its shape)."""
+    ``request_id`` (see :func:`cli_permission_response` for its shape).
+
+    ``permission_suggestions`` are the standing rules the worker offers beside
+    a one-off yes, each a permission update such as ``{"type": "addRules",
+    "rules": [{"toolName": "Bash"}], "behavior": "allow", "destination":
+    "session"}``. A controller that takes one sends it back as the answer's
+    ``updatedPermissions``."""
     request: dict[str, Any] = {
         "subtype": "can_use_tool",
         "tool_name": tool_name,
@@ -568,7 +575,30 @@ def worker_permission_request(
     }
     if description:
         request["description"] = description
+    if permission_suggestions:
+        request["permission_suggestions"] = permission_suggestions
     return {"type": RC.CONTROL_REQUEST, "request_id": request_id, "request": request}
+
+
+def worker_status(status: str | None) -> dict:
+    """A ``system/status`` event: what the worker is busy with outside a
+    model call. Claude Code posts ``compacting`` while it compacts its
+    context, then ``None`` when it is done."""
+    return {"type": RC.SYSTEM, "subtype": RCSystem.STATUS, "status": status}
+
+
+def worker_compact_boundary(
+    *, trigger: str = "auto", pre_tokens: int | None = None, post_tokens: int | None = None
+) -> dict:
+    """A ``system/compact_boundary`` event: the point in the transcript where
+    the worker compacted its context. ``trigger`` is ``auto`` or ``manual``;
+    the token counts are the context's size before and after, where known."""
+    metadata: dict[str, Any] = {"trigger": trigger}
+    if pre_tokens is not None:
+        metadata["pre_tokens"] = pre_tokens
+    if post_tokens is not None:
+        metadata["post_tokens"] = post_tokens
+    return {"type": RC.SYSTEM, "subtype": RCSystem.COMPACT_BOUNDARY, "compact_metadata": metadata}
 
 
 # --- Outbound builders: Managed Agents -------------------------------------

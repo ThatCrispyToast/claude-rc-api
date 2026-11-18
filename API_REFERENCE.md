@@ -358,15 +358,17 @@ live unless noted):
 | `background_tasks` | `tool_use_id?` | backgrounds the running foreground shell task (`{backgrounded}`), or all of them — unverified |
 | `get_context_usage` | `detail?: summary \| full` | `{totalTokens, maxTokens, percentage, model, autoCompactThreshold, isAutoCompactEnabled, categories:[{name, tokens, kind}], gridRows, messageBreakdown, …}` |
 | `get_usage` | `skip_behaviors?` | `{subscription_type, rate_limits:{limits:[{kind: session \| weekly_all \| weekly_scoped, percent, resets_at, severity, scope}], five_hour, seven_day, …}, session:{total_cost_usd, total_lines_added, …}}` |
-| `get_workspace_diff` | — | `{diff: {stats:{filesCount, linesAdded, linesRemoved}, perFileStats, hunks, restricted, skippedLarge, source} \| null}` — `null` outside git; an 8 s budget, then error_code `workspace_diff_pending` |
+| `get_workspace_diff` | — | `{diff: {stats:{filesCount, linesAdded, linesRemoved}, perFileStats:[{path, added, removed, isBinary, isUntracked, status: modified \| added \| deleted}], hunks:[{path, hunks:[{oldStart, oldLines, newStart, newLines, lines}]}], omitted:{exact, files}, restricted, skippedLarge, rootId, source:{kind: "working-tree"}} \| null}` — the working tree against its last commit; each of `lines` keeps its `+`, `-` or space. An untracked file is listed (`isUntracked`, `status: added`, counts 0) with no hunks. `null` outside git, where claude.ai also reads `noDiffReason` (`"no-repository"`); an 8 s budget, then error_code `workspace_diff_pending` |
 | `mcp_status` | — | `{mcpServers: [{name, status}]}` |
 | `rename_session` | `title` | renames the worker's *local* session only — the title controllers list is `PUT /v1/code/sessions/{id}` (§3.1) |
 | `set_color` | `color` | unverified |
-| `file_suggestions` / `read_file` | `query` / `path, max_bytes?, encoding?, anchor?` | `{suggestions:[{path}]}` / file content + `absPath` — unverified |
+| `file_suggestions` / `read_file` | `query` / `path, max_bytes?, encoding?, anchor?` | `{suggestions:[{path}]}`: a fuzzy search of the working directory; `""` lists its top level and `"dir/"` that directory, folders marked by a trailing `/`. / `{absPath, contents, lossy, truncated?}`, `absPath` echoing the path asked for; a file it won't read is the error `read denied: <path>`. Both verified 2026-11-18 |
 | `mcp_authenticate`, `mcp_oauth_callback_url`, `mcp_reconnect`, `mcp_set_servers` | | MCP management; claude.ai's `mcp_set_servers` (server-injected MCP) is refused on RC sessions |
 | `fork_conversation` | | `{forked: false, reason: "requires_remote_control_server"}` on a plain RC worker |
 
-Anything else gets `"REPL bridge does not handle control_request subtype: …"`:
+Anything else gets `"REPL bridge does not handle control_request subtype: …"`
+with error_code `unsupported_request` (`list_directory` and `get_settings`,
+which claude.ai's code also knows, among them):
 claude.ai's `rewind_conversation` (`target_message_uuid`,
 `last_seen_user_message_uuid`) is one, seen refused by a 2.1.318 worker.
 claude.ai also sends `end_session` with `reason: "archived"`; the logs hold no
@@ -652,8 +654,19 @@ to the request's `anthropic-client-platform`. The server adds its own
 worker can keep its own bookkeeping there. The CLI's own are
 `remote-control-repl` (a session started in the terminal),
 `remote-control-cli`, `remote-control-app`, `remote-control-sdk`. The CLI also
-sends `session_grouping_id` and, for a git checkout, `config.sources` /
-`config.outcomes` (from the binary).
+sends `session_grouping_id` (from the binary).
+
+For a checkout of a GitHub repository the CLI adds the repository to `config`
+(read back from a live session, 2026-11-18; `create_session(repository=,
+branch=)` sends the same):
+```json
+"sources":  [{ "type": "git_repository", "url": "https://github.com/OWNER/NAME", "revision": "main" }],
+"outcomes": [{ "type": "git_repository", "git_info": { "type": "github", "repo": "OWNER/NAME", "branches": [] } }]
+```
+A session made without them gets the server's tag `config:no-git-repo`.
+claude.ai/code lists such a session under "Remote Control" rather than under
+its repository, and never asks its worker for a workspace diff: the Changes
+panel stays at "No changes to show".
 
 **`POST /v1/code/sessions/{id}/bridge`** — `bridge_session()`: claim the worker
 seat. Body `{}`, or `{"expected_epoch": N}` to claim only if the seat is still
@@ -700,7 +713,14 @@ raw_command?}` and the CLI mirrors the prompt in
 `external_metadata.pending_action` (the same plus `input`), clearing both to
 `null` afterwards. `external_metadata` keys are merged into the session's
 (`model`, `effort_level`, `permission_mode`, `context_usage: {used_tokens,
-max_tokens}` …; `null` clears one). `{"connection_status": "disconnected"}` is
+max_tokens}` …; `null` clears one). Claude Code also reports
+`container_cc_version` (its own version), `current_branches` (`{"OWNER/NAME":
+"main"}`), `worktree_state`
+(per repository: `branch`, `head_sha`, `is_dirty`, `unpushed_count`,
+`upstream_exists` …), `rate_limit_info`, `turn` and `user_switched_model`.
+⚠️ claude.ai asks a worker for `get_workspace_diff` only once the session's
+`container_cc_version` is known and is 2.1.198 or later: a worker that leaves
+it out gets no diff panel. `{"connection_status": "disconnected"}` is
 the goodbye: the session shows as disconnected at once, and **stays so for
 that epoch** even if it reports state again. Coming back means claiming the
 seat again.
@@ -721,12 +741,21 @@ down this stream, never the worker's own events.
   are the `initialize` requests of a controller that opened the session
   meanwhile.
 - What arrives: `user` messages (the payload gains `client_platform`,
-  `server_received_wall_ms`, `trace_context`); `control_request`s (§3.2's
+  `server_received_wall_ms`, `trace_context`, and `file_attachments` when
+  files were attached: below); `control_request`s (§3.2's
   table is what Claude Code serves; a worker answers what it can and refuses
   the rest); the `control_response` that answers one of the worker's own
   prompts, which claude.ai sends twice; and `control_cancel_request`.
-- claude.ai sends on every attach: `initialize` (twice), `get_context_usage`,
-  `mcp_set_servers`, and `get_workspace_diff` when its diff panel opens. Its
+- **Attached files come by reference.** A `user` event from claude.ai lists
+  them beside its `message`: `file_attachments: [{file_uuid, file_name,
+  is_image, mime_type}]`. The worker fetches each with the account's OAuth
+  login, not the worker token: `GET /api/oauth/files/{file_uuid}/content` →
+  the bytes, `application/octet-stream` (`download_file()`; answered on both
+  `api.anthropic.com` and `claude.ai`, 404 `not_found_error` for an unknown
+  id). Claude Code saves them and names their paths in the prompt.
+- claude.ai sends on every attach: `initialize` (two or three times),
+  `get_context_usage`, `mcp_set_servers`, and `get_workspace_diff` (again
+  after each turn; see `container_cc_version` above). Its
   mode menu sends `set_permission_mode` with `auto`, `default` ("Manual"),
   `acceptEdits` or `plan`; its model menu sends `set_model` with a Claude
   model id.
@@ -797,6 +826,32 @@ waits on or draws from.
   session in its list. The answer is a `control_response` whose inner
   `response` is `{behavior: "allow" | "deny", …}` (§3.2). The worker takes a
   prompt down with a `control_cancel_request` naming it.
+- **"Always allow"** appears on a permission card whose request carries
+  `permission_suggestions`, e.g. `[{"type": "addRules", "rules": [{"toolName":
+  "Bash", "ruleContent": "npm test"}], "behavior": "allow", "destination":
+  "session"}]`. It becomes the card's main button, with *Allow once* in a
+  menu beside it, under the line "“Always allow” lasts for this session and
+  covers: Bash(npm test)", whatever `destination` says. An answer that took it
+  carries the rules back as `updatedPermissions`; *Allow once* carries none.
+- **Slash commands.** The app's `/` menu is its own list (`/btw`, `/model`,
+  `/effort`, `/status`, `/usage`, `/diff`, `/compact` …) plus the worker's
+  `slash_commands` from `system/init`, those shown as "Custom command". Many
+  it runs itself and never sends (`/status`, `/usage`, `/config`, `/help`,
+  `/tasks`). `/model <id>` arrives as `set_model` with whatever id was typed,
+  and the app was seen to send that `set_model` again before the next
+  message. Others arrive as `user` messages holding the command's text
+  (`/effort`, `/compact`, `/sandbox`), for the worker to run as Claude Code
+  would. `/fast`, sent to a worker that did not advertise it, was stopped in
+  the app instead: "/fast isn't a command here."
+- **Its panels are the worker's answers.** `@` in the message box and the
+  Files panel send `file_suggestions` (`""`, then what is typed, or `"dir/"`
+  for a folder), a file opened there sends `read_file`, the Changes panel
+  shows `get_workspace_diff`, and `/btw` opens a Side chat that sends
+  `side_question` and shows its `response`.
+- **A compaction** shows as "Compacted session" where a
+  `system/compact_boundary` event sits (`compact_metadata: {trigger: auto |
+  manual, pre_tokens?, post_tokens?}`); Claude Code brackets it with
+  `system/status` events, `{status: "compacting"}` then `{status: null}`.
 - **The model label** reads "Unsupported model" for a model id the app doesn't
   know, and its menu offers Claude models only.
 - **The title** is the session's (`PUT /v1/code/sessions/{id}`, §3.1), which

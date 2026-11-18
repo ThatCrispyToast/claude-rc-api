@@ -24,6 +24,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Iterator, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -447,19 +448,51 @@ class RemoteControlClient:
         cwd: str | None = None,
         model: str | None = None,
         tags: Iterable[str] | None = None,
+        repository: str | None = None,
+        branch: str | None = None,
     ) -> dict:
         """``POST /v1/code/sessions`` — a new Remote Control session, as the
         Claude Code CLI creates one for itself. It is listed at once, in your
         claude.ai/code and apps only, and stays ``disconnected`` until a worker
         claims it (:class:`~claude_rc.worker.RemoteControlWorker`). Returns the
-        session. There is no delete: a session can only be archived."""
+        session. There is no delete: a session can only be archived.
+
+        ``repository`` is the GitHub repository the worker's checkout is of,
+        as ``owner/name``, and ``branch`` the one it is on. The CLI sends both
+        for a git checkout. A session made without them is tagged
+        ``config:no-git-repo``, and the app does not ask its worker for a
+        workspace diff."""
         config: dict[str, Any] = {"cwd": cwd or os.getcwd()}
         if model:
             config["model"] = model
+        if repository:
+            config["sources"] = [{
+                "type": "git_repository", "url": f"https://github.com/{repository}",
+                **({"revision": branch} if branch else {}),
+            }]
+            config["outcomes"] = [{
+                "type": "git_repository", "git_info": {"type": "github", "repo": repository, "branches": []},
+            }]
         body: dict[str, Any] = {"title": title, "bridge": {}, "config": config}
         if tags:
             body["tags"] = list(tags)
         return _unwrap_session(self._ok(self._request("POST", self._url(), json=body), 200, 201))
+
+    def download_file(self, file_uuid: str, *, max_bytes: int | None = None) -> bytes:
+        """``GET /api/oauth/files/{uuid}/content`` — the bytes of a file a
+        controller attached to a message. An app attaches by reference: its
+        ``user`` event lists ``file_attachments``, each ``{file_uuid,
+        file_name, is_image, mime_type}``, and the worker fetches what it
+        wants of them with the account's login, as Claude Code does. Raises
+        :class:`APIError` if the file can't be had, or is longer than
+        ``max_bytes``."""
+        url = f"{self.base_url}/api/oauth/files/{quote(file_uuid, safe='')}/content"
+        resp = self._request("GET", url)
+        if resp.status_code != 200:
+            raise APIError(resp.status_code, resp.text, resp.headers.get("request-id"))
+        if max_bytes is not None and len(resp.content) > max_bytes:
+            raise APIError(413, f"the file is {len(resp.content)} bytes, over the {max_bytes} asked for", None)
+        return resp.content
 
     def bridge_session(self, session_id: str, *, expected_epoch: int | None = None) -> dict:
         """``POST /v1/code/sessions/{id}/bridge`` — claim a session's worker
