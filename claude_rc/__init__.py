@@ -14,6 +14,9 @@ Quick start (Remote Control — steer a live `claude remote-control` session):
     sid = rc.sessions()[0]["id"]
     for ev in rc.send_and_collect(sid, "run the tests", print_stream=True):
         ...
+
+`RemoteControlWorker` takes the other side: it hosts a session of your own,
+which claude.ai/code and the Claude apps then list and steer (see worker.py).
 """
 
 from ._version import __version__
@@ -48,16 +51,27 @@ from .events import (
     cli_permission_response,
     cli_question_response,
     cli_dialog_response,
+    worker_init,
+    worker_initialize_response,
+    worker_assistant,
+    worker_stream_event,
+    worker_tool_result,
+    worker_result,
+    worker_control_response,
+    worker_permission_request,
     user_message,
     interrupt,
     custom_tool_result,
 )
 from .sse import SSEFrame, parse_sse
 from .webui import serve as serve_webui
+from .worker import RemoteControlWorker, WorkerEvicted
 
 __all__ = [
     "__version__",
     "RemoteControlClient",
+    "RemoteControlWorker",
+    "WorkerEvicted",
     "ManagedAgentsClient",
     "APIError",
     "ControlRejected",
@@ -81,6 +95,14 @@ __all__ = [
     "cli_permission_response",
     "cli_question_response",
     "cli_dialog_response",
+    "worker_init",
+    "worker_initialize_response",
+    "worker_assistant",
+    "worker_stream_event",
+    "worker_tool_result",
+    "worker_result",
+    "worker_control_response",
+    "worker_permission_request",
     "user_message",
     "interrupt",
     "custom_tool_result",

@@ -3,7 +3,10 @@
 Unofficial Python client for Claude Code Remote Control, reverse-engineered from
 the Claude Code CLI and exercised against the live API.
 
-It comes as a [library](#library), a [CLI](#cli) and a [web UI](#web-ui). The
+It comes as a [library](#library), a [CLI](#cli) and a [web UI](#web-ui), which
+steer the Claude Code sessions running on your machines the way claude.ai/code
+does. The library can also take the other side and
+[host a session](#hosting-a-session) that claude.ai/code then steers. The
 protocol is written up in [`API_REFERENCE.md`](./API_REFERENCE.md).
 
 > [!WARNING]
@@ -197,6 +200,69 @@ rc.stop_task(sid, "b5rkopq8x")    # task_id from a system/task_started event
 rc.request_control(sid, "mcp_status")
 ```
 
+### Hosting a session
+
+`RemoteControlWorker` holds a session's worker seat, the part the `claude`
+process normally plays. The session is listed in your claude.ai/code and Claude
+apps, what you send it there arrives here, and what this side writes is the
+transcript they show. What answers is up to you: the server checks that the
+worker holds the seat, not that it is Claude Code.
+
+```python
+import os
+from claude_rc import (RemoteControlClient, RemoteControlWorker, worker_assistant,
+                       worker_init, worker_initialize_response)
+
+rc = RemoteControlClient()
+session = rc.create_session("echo")    # listed at once, with no worker yet
+init = worker_init(model="echo", cwd=os.getcwd())
+
+with RemoteControlWorker(rc, session["id"]) as worker:    # claims the seat, heartbeats
+    worker.send(init)
+    for ev in worker.events():         # what controllers send, as it arrives
+        if ev.type == "user":
+            worker.begin_turn(ev)
+            worker.send(worker_assistant(f"echo: {ev.text()}", model="echo"))
+            worker.end_turn(ev)        # posts the `result` controllers wait for
+        elif ev.control_subtype == "initialize":    # each controller sends it as it attaches
+            worker.respond(ev, worker_initialize_response(model="echo"))
+            worker.send(init)
+        elif ev.type == "control_request":
+            worker.reject(ev, f"not supported: {ev.control_subtype}")
+```
+
+That loop is the whole contract, and the app waits on each part of it: a
+`system/init` at the start and after every `initialize`, a turn around every
+user message, and an answer to every control request (a refusal is always
+safe). [`examples/echo_worker.py`](./examples/echo_worker.py) runs it.
+
+The rest of a Claude Code transcript is there to use:
+
+```python
+from claude_rc import worker_stream_event, worker_tool_result
+
+# a tool call and its result: the app draws Bash, Write and Edit as it does Claude Code's
+call = {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}
+worker.send(worker_assistant([call], model="echo"), worker_tool_result("t1", "README.md\n"))
+
+# ask before acting: a permission card in the app, the session waiting on it
+request_id = worker.request_permission("Bash", {"command": "rm -r build"},
+                                       tool_use_id="t2", description="Run: rm -r build")
+# ... the answer arrives through events() as a control_response naming request_id
+
+# a reply as it is written, for whoever is watching
+delta = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hel"}}
+worker.send(worker_stream_event(delta), ephemeral=True)
+
+worker.report_metadata(model="echo", context_usage={"used_tokens": 1200, "max_tokens": 8000})
+```
+
+A session has one worker at a time. Claiming the seat evicts whoever held it,
+whose calls then raise `WorkerEvicted`; so does archiving the session. Messages
+sent while no worker was attached are delivered when one connects.
+[API_REFERENCE.md §5](./API_REFERENCE.md#5-the-worker-side-hosting-a-session)
+has the protocol, and what the app expects of a worker.
+
 ### Managed Agents
 
 `ManagedAgentsClient` covers the sibling public Sessions API (`/v1/sessions`,
@@ -259,6 +325,17 @@ your script ──► POST /v1/code/sessions/{id}/events           send a messag
 Each request carries the claude.ai OAuth Bearer token and an
 `x-organization-uuid` header.
 
+`RemoteControlWorker` plays the other role, the local process's. It creates a
+session and claims its worker seat with the same OAuth token, and from then on
+uses the seat's own short-lived token:
+
+```
+your worker ──► POST /v1/code/sessions, …/{id}/bridge        create a session, claim its seat
+            ◄── GET  …/{id}/worker/events/stream             what controllers send (SSE)
+            ──► POST …/{id}/worker/events                    the transcript
+            ──► PUT  …/{id}/worker, POST …/worker/heartbeat  state, liveness
+```
+
 ## Credentials
 
 The client finds your login the way the CLI does, and an environment variable
@@ -294,6 +371,10 @@ has the details.
 - **Steering injects into a live session**, so only use `send`, `repl`,
   `send_message`, `interrupt` and the other steering calls on sessions you own.
   `rename`, `pin` and `archive` change what every controller's list shows.
+- **Hosting adds a session to your account.** `create_session` lists a new
+  session in your claude.ai/code and apps (yours only). Sessions can't be
+  deleted, only archived. Claiming the seat of a session that has a worker
+  (`RemoteControlWorker` on a live Claude Code session's id) evicts that worker.
 - **Worker queries leave a trace.** `ask`, `info`, `side_question` and `get_*`
   leave a `control_request` / `control_response` pair in the event log, as
   claude.ai's own attach does. A side question also costs a model call.
@@ -313,7 +394,8 @@ uv run --extra test pytest -q       # offline: no network, no credentials
 claude_rc/
   credentials.py   # OAuth load + refresh (file or macOS Keychain), org uuid
   client.py        # RemoteControlClient (mode A) + ManagedAgentsClient (mode B)
-  events.py        # Event model + builders for both wire formats
+  worker.py        # RemoteControlWorker: the worker side of a session
+  events.py        # Event model + builders for both wire formats, both sides
   sse.py           # dependency-free SSE parser
   cli.py           # `claude-rc` command line
   webui.py         # `claude-rc web`, the stdlib http.server control panel

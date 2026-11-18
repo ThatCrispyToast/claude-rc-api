@@ -439,6 +439,42 @@ class RemoteControlClient:
         self._ok(resp)  # raises
         return False
 
+    # -- hosting a session (the worker's two OAuth calls) --------------------
+    def create_session(
+        self,
+        title: str,
+        *,
+        cwd: str | None = None,
+        model: str | None = None,
+        tags: Iterable[str] | None = None,
+    ) -> dict:
+        """``POST /v1/code/sessions`` — a new Remote Control session, as the
+        Claude Code CLI creates one for itself. It is listed at once, in your
+        claude.ai/code and apps only, and stays ``disconnected`` until a worker
+        claims it (:class:`~claude_rc.worker.RemoteControlWorker`). Returns the
+        session. There is no delete: a session can only be archived."""
+        config: dict[str, Any] = {"cwd": cwd or os.getcwd()}
+        if model:
+            config["model"] = model
+        body: dict[str, Any] = {"title": title, "bridge": {}, "config": config}
+        if tags:
+            body["tags"] = list(tags)
+        return _unwrap_session(self._ok(self._request("POST", self._url(), json=body), 200, 201))
+
+    def bridge_session(self, session_id: str, *, expected_epoch: int | None = None) -> dict:
+        """``POST /v1/code/sessions/{id}/bridge`` — claim a session's worker
+        seat: ``{worker_jwt, expires_in, api_base_url, worker_epoch}``. The
+        token is the worker's bearer for ``…/worker/*``, good for
+        ``expires_in`` seconds.
+
+        Every claim starts a new epoch, and the server then refuses the
+        previous one's calls (409 ``epoch_conflict``): a session has one
+        worker at a time. ``expected_epoch`` makes the claim conditional on
+        the seat still being at that epoch, which is how a worker renews its
+        own token without taking the seat back from a successor."""
+        body = {} if expected_epoch is None else {"expected_epoch": expected_epoch}
+        return self._ok(self._request("POST", self._url(session_id, "bridge"), json=body), 200)
+
     def watch_sessions(
         self,
         *,

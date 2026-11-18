@@ -19,8 +19,14 @@ Two wire formats share these endpoints:
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+# The Claude Code version whose worker protocol the ``worker_*`` builders speak.
+# A worker reports it as its ``claude_code_version``, which controllers read to
+# decide what the worker supports.
+CLAUDE_CODE_VERSION = "2.1.327"
 
 
 def _to_int(v: Any) -> Optional[int]:
@@ -365,6 +371,204 @@ def cli_dialog_response(request_id: str, *, completed: bool, result: dict | None
     sample — the ``result`` shape is opaque per ``dialog_kind``."""
     inner = {"status": "completed" if completed else "cancelled", "result": (result or {}) if completed else {}}
     return cli_control_response(request_id, inner)
+
+
+# --- Outbound builders: a Remote Control worker ------------------------------
+# What a worker writes into its session's log (see claude_rc.worker). The shapes
+# are the Claude Code CLI's, trimmed to what claude.ai/code needed to render a
+# session whose worker is something else (checked live 2026-11-18).
+def worker_init(
+    *,
+    model: str,
+    cwd: str,
+    permission_mode: str = "default",
+    version: str = CLAUDE_CODE_VERSION,
+    **fields: Any,
+) -> dict:
+    """The ``system/init`` event: the worker's live settings. Post it on
+    attaching, after answering a controller's ``initialize``, and whenever the
+    model or permission mode changes. Controllers read the newest one.
+    ``fields`` adds or replaces keys (``tools``, ``slash_commands``, ``effort`` …)."""
+    return {
+        "type": RC.SYSTEM,
+        "subtype": RCSystem.INIT,
+        "model": model,
+        "cwd": cwd,
+        "permissionMode": permission_mode,
+        "claude_code_version": version,
+        "apiKeySource": "none",
+        "output_style": "default",
+        "tools": [],
+        "mcp_servers": [],
+        "slash_commands": [],
+        "agents": [],
+        "skills": [],
+        "plugins": [],
+        "capabilities": [],
+        **fields,
+    }
+
+
+def worker_initialize_response(
+    *,
+    model: str,
+    permission_mode: str = "default",
+    version: str = CLAUDE_CODE_VERSION,
+    **fields: Any,
+) -> dict:
+    """The answer to a controller's ``initialize`` control request, which
+    claude.ai sends on every attach: pass it to
+    :meth:`~claude_rc.worker.RemoteControlWorker.respond`."""
+    return {
+        "claude_code_version": version,
+        "current_model": model,
+        "current_permission_mode": permission_mode,
+        "commands": [],
+        "agents": [],
+        "models": [],
+        "account": {},
+        "output_style": "normal",
+        "available_output_styles": ["normal"],
+        **fields,
+    }
+
+
+def worker_assistant(
+    content: str | list[dict],
+    *,
+    model: str,
+    message_id: str | None = None,
+    stop_reason: str | None = None,
+    usage: dict | None = None,
+    parent_tool_use_id: str | None = None,
+) -> dict:
+    """An ``assistant`` event: one message of the transcript. ``content`` is
+    text or Messages-API content blocks (``text``, ``thinking``, ``tool_use``).
+    Events that share a ``message_id`` are parts of one message, as when the
+    CLI posts a turn's text and each of its tool calls separately."""
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    return {
+        "type": RC.ASSISTANT,
+        "parent_tool_use_id": parent_tool_use_id,
+        "message": {
+            "id": message_id or f"msg_{uuid.uuid4().hex[:24]}",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": content,
+            "stop_reason": stop_reason,
+            "stop_sequence": None,
+            "usage": usage or {"input_tokens": 0, "output_tokens": 0},
+        },
+    }
+
+
+def worker_stream_event(event: dict, *, parent_tool_use_id: str | None = None) -> dict:
+    """A ``stream_event``: one Messages-API streaming event (``message_start``,
+    ``content_block_start``, ``content_block_delta``, ``content_block_stop``,
+    ``message_delta``, ``message_stop``) of a message still being written.
+    Send these ``ephemeral``: they draw the reply as it grows for whoever is
+    watching, and the ``assistant`` event that follows, with the same message
+    ``id`` as the ``message_start``, is what stays."""
+    return {"type": RC.STREAM_EVENT, "event": event, "parent_tool_use_id": parent_tool_use_id}
+
+
+def worker_tool_result(
+    tool_use_id: str,
+    content: str | list[dict],
+    *,
+    is_error: bool = False,
+    parent_tool_use_id: str | None = None,
+) -> dict:
+    """A ``user`` event carrying a tool's result, which closes the
+    ``tool_use`` block of that id in the transcript."""
+    block = {"type": "tool_result", "tool_use_id": tool_use_id, "content": content, "is_error": is_error}
+    return {
+        "type": RC.USER,
+        "parent_tool_use_id": parent_tool_use_id,
+        "message": {"role": "user", "content": [block]},
+    }
+
+
+def worker_result(
+    *,
+    result: str = "",
+    is_error: bool = False,
+    subtype: str | None = None,
+    user_message_uuid: str | None = None,
+    duration_ms: int = 0,
+    num_turns: int = 1,
+    usage: dict | None = None,
+    **fields: Any,
+) -> dict:
+    """The ``result`` event that ends a turn. Controllers wait for it: without
+    one the turn never finishes for them. ``subtype`` defaults to ``success``,
+    or ``error_during_execution`` when ``is_error``; ``user_message_uuid`` names
+    the user message the turn answered."""
+    payload: dict[str, Any] = {
+        "type": RC.RESULT,
+        "subtype": subtype or ("error_during_execution" if is_error else "success"),
+        "is_error": is_error,
+        "result": result,
+        "stop_reason": None if is_error else "end_turn",
+        "duration_ms": duration_ms,
+        "duration_api_ms": 0,
+        "num_turns": num_turns,
+        "total_cost_usd": 0,
+        "usage": usage or {"input_tokens": 0, "output_tokens": 0},
+        **fields,
+    }
+    if user_message_uuid:
+        payload["user_message_uuid"] = user_message_uuid
+    return payload
+
+
+def worker_control_response(
+    request_id: str,
+    response: dict | None = None,
+    *,
+    error: str | None = None,
+    error_code: str | None = None,
+    **fields: Any,
+) -> dict:
+    """A worker's verdict on a controller's ``control_request``: success with
+    ``response``, or an error when ``error`` is given (``error_code`` being its
+    machine-readable kind). ``fields`` ride beside the response, as the
+    ``pending_permission_requests`` list does on an ``initialize`` answer: the
+    worker's open prompts (whole ``can_use_tool`` requests), which is how a
+    controller attaching mid-prompt gets to show them."""
+    if error is None:
+        verdict: dict[str, Any] = {"subtype": "success", "request_id": request_id, "response": response or {}}
+    else:
+        verdict = {"subtype": "error", "request_id": request_id, "error": error}
+        if error_code:
+            verdict["error_code"] = error_code
+    return {"type": RC.CONTROL_RESPONSE, "response": {**verdict, **fields}}
+
+
+def worker_permission_request(
+    request_id: str,
+    tool_name: str,
+    tool_input: dict,
+    *,
+    tool_use_id: str,
+    description: str | None = None,
+    display_name: str | None = None,
+) -> dict:
+    """A ``can_use_tool`` prompt: the worker asking its controllers whether a
+    tool may run. Their answer comes back as a ``control_response`` naming
+    ``request_id`` (see :func:`cli_permission_response` for its shape)."""
+    request: dict[str, Any] = {
+        "subtype": "can_use_tool",
+        "tool_name": tool_name,
+        "display_name": display_name or tool_name,
+        "input": tool_input,
+        "tool_use_id": tool_use_id,
+    }
+    if description:
+        request["description"] = description
+    return {"type": RC.CONTROL_REQUEST, "request_id": request_id, "request": request}
 
 
 # --- Outbound builders: Managed Agents -------------------------------------

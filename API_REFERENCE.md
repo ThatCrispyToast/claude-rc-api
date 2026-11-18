@@ -1,11 +1,13 @@
 # Claude Remote Control API — Reverse-Engineered Reference
 
 > **Unofficial.** Reconstructed from the Claude Code CLI (a Bun single-file
-> executable; last mined at 2.1.322) and the API docs it embeds. These are private
+> executable; last mined at 2.1.322 for the controller side, 2.1.327 for the
+> worker side) and the API docs it embeds. These are private
 > endpoints used by `claude.ai/code` and the Claude mobile apps. They are not a
 > supported public interface and can change without notice. The list/read paths
 > here were exercised against the live API; write/steer paths are documented from
-> the client code.
+> the client code. The worker side (§5) was exercised live with a worker that
+> is not Claude Code.
 
 ---
 
@@ -29,10 +31,12 @@ There are **two related HTTP surfaces**, both on `https://api.anthropic.com`:
 | Session id prefix | `cse_…` (alias `session_…`) | `sesn_…` |
 | Event wire format | Claude Code **stream-json** (`user`/`assistant`/`result`/…) | dotted (`agent.message`/`session.status_idle`/…) |
 | Send envelope | `{session_id, events:[{payload: <ev+uuid>}]}` | `{events:[<ev>]}` |
-| Who creates the session | the local CLI (`claude remote-control`) | you, via `POST /v1/sessions` |
+| Who creates the session | its worker: the local CLI (`claude remote-control`), or any program (§5) | you, via `POST /v1/sessions` |
 
-**To act like the webpage** (the goal of this project) you use **mode A** as a
+**To act like the webpage** (what most of this project does) you use **mode A** as a
 *controller*: `GET /v1/code/sessions` → `POST …/events` → `GET …/events/stream`.
+**To act like the CLI**, hosting a session the webpage then steers, you use the
+*worker* calls of §5.
 `ccr` = **C**laude **C**ode **R**emote control; `byoc` = **b**ring-**y**our-**o**wn-**c**ompute.
 
 ---
@@ -195,8 +199,8 @@ binary. Rechecked against **2.1.322** on 2026-11-10: the worker's dispatch table
 | `POST` | `/v1/code/sessions/{id}/mark_read` | Clear `unread` → `{"unread": false}`; optional `{event_id}` (an event's UUID, what the CLI sends) names the last one read. A `sequence_num` field is ignored |
 | `POST` | `/v1/code/sessions/{id}/client/presence` | Announce/clear a watching client |
 
-There is **no DELETE** for code sessions — archive only. Session **creation** is done
-by the local CLI, not the controller (see §5). A list page is
+There is **no DELETE** for code sessions — archive only. Session **creation** is the
+worker's side of the API (`POST /v1/code/sessions`, §5.1). A list page is
 `{"data": [...], "next_cursor": …, "resume_token": …}` with the sessions bare;
 only the single-session `GET` wraps its object in `response_shape`, with or
 without `anthropic-beta` (checked live 2026-10-28). `get_session()` and
@@ -617,29 +621,205 @@ Sent events are **echoed** on the stream (first `processed_at:null`, then timest
 
 ---
 
-## 5. How a Remote Control session comes to exist (the host side)
+## 5. The worker side: hosting a session
 
-You don't create RC sessions as a controller — the local CLI does, by acting as a
-**bridge** (a private self-hosted environment worker). For context, the host flow is:
+A Remote Control session has one **worker**, the program that receives what
+controllers send and writes the transcript they read. Normally that is the
+local `claude` process. Nothing in the protocol requires it to be: the server
+checks that a worker holds the session's seat, not what it is. Everything in
+§5.1–5.3 was exercised live on 2026-11-18 with workers that are not Claude
+Code (an echo loop, and a bridge to OpenAI's Codex), and checked in
+claude.ai/code. `RemoteControlWorker` implements it. A session shows in the
+account's own claude.ai/code and apps and nowhere else.
 
-1. **Register bridge:** `POST /v1/environments/bridge`
+### 5.1 Creating a session and claiming its seat (OAuth)
+
+Two calls with the account's OAuth bearer and the Mode-A headers of §2.1. No
+environment or machine is registered, which is why a bridge session's
+`environment_id` is `""`.
+
+**`POST /v1/code/sessions`** — `create_session()`:
+```json
+{ "title": "my session", "bridge": {}, "tags": ["optional"],
+  "config": { "cwd": "/path", "model": "optional" } }
+```
+→ `{"deduplicated": false, "session": {…}}`. The session is listed at once:
+`status: active`, `connection_status: disconnected`, `worker_status:
+WORKER_STATUS_UNSPECIFIED`, `environment_kind: bridge`, and `config.origin` set
+to the request's `anthropic-client-platform`. The server adds its own
+`config:*` tags to whatever `tags` the body gave. Tags are free-form
+(`codex-thread:<uuid>` was accepted, and `?tags=` then finds the session), so a
+worker can keep its own bookkeeping there. The CLI's own are
+`remote-control-repl` (a session started in the terminal),
+`remote-control-cli`, `remote-control-app`, `remote-control-sdk`. The CLI also
+sends `session_grouping_id` and, for a git checkout, `config.sources` /
+`config.outcomes` (from the binary).
+
+**`POST /v1/code/sessions/{id}/bridge`** — `bridge_session()`: claim the worker
+seat. Body `{}`, or `{"expected_epoch": N}` to claim only if the seat is still
+at epoch `N`. →
+```json
+{ "worker_jwt": "<bearer for …/worker/*>", "expires_in": 46800,
+  "api_base_url": "https://api.anthropic.com", "worker_epoch": "1" }
+```
+- **Every claim starts a new epoch** (`worker_epoch` + 1), a conditional one
+  with the right `expected_epoch` included, and the session turns `connected`.
+- From then on the server refuses every call made as an earlier epoch with
+  **409** `{"error": {"type": "epoch_conflict", "reason": "superseded_by_worker",
+  "expected_epoch": "3", "actual_epoch": "1"}}`. That is how a session has one
+  worker at a time, and how a displaced worker finds out.
+- A conditional claim with the wrong epoch gets the same 409. A worker renews
+  its token with `expected_epoch` so that it can't take the seat back from a
+  successor.
+- The CLI sends `X-Trusted-Device-Token` here when it has one, and expects
+  `403 untrusted_device` from an org that requires Trusted Devices (§3.4), or
+  `session_security_tier_below_org_policy` (from the binary).
+
+### 5.2 The worker API (worker token)
+
+Base: `{api_base_url}/v1/code/sessions/{id}`, with `Authorization: Bearer
+<worker_jwt>` and `anthropic-version`. **Every body carries `worker_epoch`.** A
+409 on any of these means the seat is gone: `superseded_by_worker`, or
+`session_not_active` once the session is archived.
+
+| Method | Path | Body → answer |
+|---|---|---|
+| `PUT` | `/worker` | `{worker_status?, requires_action_details?, external_metadata?, connection_status?}` → `{}` — the worker's state (below) |
+| `GET` | `/worker` | → `{"worker": {external_metadata, session_id, worker_epoch, worker_status}}` |
+| `POST` | `/worker/heartbeat` | `{session_id}` → `{"heartbeat_interval_seconds": 20}` |
+| `GET` | `/worker/events/stream` | SSE: what controllers send (below) |
+| `POST` | `/worker/events` | `{events: [{payload, ephemeral?}]}` → `{results: [{event_id, sequence_num, duplicate}], has_subscribers}` |
+| `POST` | `/worker/events/delivery` | `{updates: [{event_id, status}]}` → `{}` |
+
+**State** (`PUT /worker`). `worker_status` is `idle`, `running` or
+`requires_action`; the session object's `worker_status` and `status_bucket`
+follow it. The first PUT of an epoch registers the worker. While
+`requires_action`, `requires_action_details` is `{tool_name,
+action_description, request_id, tool_use_id, display_tool_name?,
+raw_command?}` and the CLI mirrors the prompt in
+`external_metadata.pending_action` (the same plus `input`), clearing both to
+`null` afterwards. `external_metadata` keys are merged into the session's
+(`model`, `effort_level`, `permission_mode`, `context_usage: {used_tokens,
+max_tokens}` …; `null` clears one). `{"connection_status": "disconnected"}` is
+the goodbye: the session shows as disconnected at once, and **stays so for
+that epoch** even if it reports state again. Coming back means claiming the
+seat again.
+
+**Heartbeat** every `heartbeat_interval_seconds`. The CLI adds
+`supports_heartbeat_probe`, `current_interval_seconds` and `idle_seconds`, and
+on exit `release_lease: true` (from the binary).
+
+**Inbound** (`GET /worker/events/stream`, `Accept: text/event-stream`).
+`?from_sequence_num=N` plus a `Last-Event-ID: N` header resume after `N`.
+Frames are `client_event` (`id:` = the sequence number), with `:keepalive`
+comments about every 15 s. The data is an envelope like a controller's (§3.3)
+with `source: "client"` and `sender_class`: only what controllers wrote comes
+down this stream, never the worker's own events.
+- From the start (no `from_sequence_num`), the server sends **the events no
+  worker has reported `processed`**, and none of the finished ones. A message
+  sent while no worker was attached is delivered when one connects, and so
+  are the `initialize` requests of a controller that opened the session
+  meanwhile.
+- What arrives: `user` messages (the payload gains `client_platform`,
+  `server_received_wall_ms`, `trace_context`); `control_request`s (§3.2's
+  table is what Claude Code serves; a worker answers what it can and refuses
+  the rest); the `control_response` that answers one of the worker's own
+  prompts, which claude.ai sends twice; and `control_cancel_request`.
+- claude.ai sends on every attach: `initialize` (twice), `get_context_usage`,
+  `mcp_set_servers`, and `get_workspace_diff` when its diff panel opens. Its
+  mode menu sends `set_permission_mode` with `auto`, `default` ("Manual"),
+  `acceptEdits` or `plan`; its model menu sends `set_model` with a Claude
+  model id.
+
+**Delivery** (`POST /worker/events/delivery`): `status` is `received`,
+`processing` (a turn took the message) or `processed`. Controllers see these as
+`delivery_update` frames, and `processed` is what stops redelivery. The CLI can
+also fold `delivery_updates` into an events upload.
+
+**Outbound** (`POST /worker/events`): each row is `{"payload": <stream-json
+event with a uuid>}`, plus `"ephemeral": true` for events that are shown to
+whoever is watching and not stored (`stream_event` deltas). An event is stored
+once per `uuid` (`duplicate: true` on a repeat), so an upload is safe to
+retry. `has_subscribers` says whether any controller has the session open.
+The CLI also marks replayed history with `"historical": true`, which the
+server accepts with no visible difference, and mirrors its transcript to
+`POST /worker/internal-events` for its own resume (from the binary).
+
+**Token.** `worker_jwt` lasts `expires_in` seconds (13 hours). The CLI renews
+by claiming again with `expected_epoch`. `RemoteControlWorker` does the same
+shortly before the token ends or on a 401, then reports its state under the
+new epoch and redials the event stream; the session stays `connected`
+throughout.
+
+### 5.3 What claude.ai/code expects of a worker
+
+Checked in the web app with a non-Claude worker. Each is something the app
+waits on or draws from.
+
+- **`system/init`** on attaching, after each `initialize`, and when the model,
+  mode or effort changes: `model`, `cwd`, `permissionMode`,
+  `claude_code_version`, `tools`, `slash_commands` … (§3.3). The mode label
+  comes from `permissionMode`.
+- **An answer to every `control_request`.** `initialize` wants
+  `{claude_code_version, current_model, current_permission_mode, commands,
+  agents, models, account, output_style, available_output_styles}`, with
+  `pending_permission_requests` (the worker's open `can_use_tool` requests,
+  whole) and `pending_user_dialog_requests` beside it. A refusal is always
+  safe: the app shows a toast ("Model change couldn't be applied", "Couldn't
+  switch to Auto. Still using Accept edits").
+- ⚠️ **`get_context_usage` must be refused or answered in full.** A success
+  with only some of Claude Code's keys (§3.2) breaks the session page
+  ("Something went wrong loading this session"). With `totalTokens`,
+  `maxTokens`, `rawMaxTokens`, `percentage`, `model`, `categories`, `gridRows`,
+  `agents`, `mcpTools`, `memoryFiles`, `skills`, `slashCommands`,
+  `messageBreakdown`, `apiUsage`, `autoCompactThreshold` and
+  `isAutoCompactEnabled` present (empty lists are fine), the context meter
+  works.
+- **A turn** is: delivery `processing` and state `running`, the transcript
+  events, a **`result`**, delivery `processed`, state `idle`. Without the
+  `result` the turn never ends for a controller. An interrupted turn's
+  `result` carries `terminal_reason: "aborted_streaming"`.
+- **The transcript** is `assistant` events (text, `thinking`, `tool_use`
+  blocks) and `user` events carrying `tool_result`. A `tool_use` named after
+  one of Claude Code's tools is drawn as that tool: `Bash {command}` as "Ran
+  a command", `Write {file_path, content}` and `Edit {file_path, old_string,
+  new_string}` as a file card with its diff (and an entry under Outputs). A
+  worker's `user` event with text content shows as a message the user typed
+  at the terminal.
+- **A reply as it is written**: ephemeral `stream_event`s (`message_start`,
+  `content_block_start`, `content_block_delta` with a `text_delta`,
+  `content_block_stop`), then the stored `assistant` event with the same
+  message `id`, then `message_delta` and `message_stop`.
+- **A permission prompt** is a `can_use_tool` `control_request` from the worker
+  (`tool_name`, `display_name`, `input`, `tool_use_id`, `description`) with the
+  state `requires_action`. The app draws a card ("Allow Claude to write
+  hello.txt?", the input as a diff, *Deny* / *Allow once*) and flags the
+  session in its list. The answer is a `control_response` whose inner
+  `response` is `{behavior: "allow" | "deny", …}` (§3.2). The worker takes a
+  prompt down with a `control_cancel_request` naming it.
+- **The model label** reads "Unsupported model" for a model id the app doesn't
+  know, and its menu offers Claude models only.
+- **The title** is the session's (`PUT /v1/code/sessions/{id}`, §3.1), which
+  the worker's login may change at any time.
+
+### 5.4 The older environment flow (from the binary, not exercised)
+
+`claude remote-control` in server mode advertises a *machine*, on which the
+app can then start sessions:
+
+1. **Register:** `POST /v1/environments/bridge`
    `{machine_name, directory, branch, git_repo_url, max_sessions, metadata:{worker_type:"claude_code"}}` → `{environment_id}`.
 2. **Long-poll for work:** `GET /v1/environments/{env}/work/poll` → work items
    `{id, secret(base64url JSON {version:1, session_ingress_token}), data:{type:"session", id:"cse_..."}}`.
 3. **Per-session worker:** `POST /v1/code/sessions/{id}/worker/register`
-   (Bearer = `session_ingress_token`) → `{worker_epoch}`, then read **inbound** user
-   events from `GET /v1/code/sessions/{id}/worker/events/stream`, `ack`/`heartbeat`
-   the work item, and post `assistant`/tool events back via `POST …/{id}/events`.
-4. **Session log mirror:** persisted to a `remoteIngressUrl`
-   (`GET /v1/session_ingress/session/{id}` to read back), with `x-last-uuid` 409 reconciliation.
+   (Bearer = `session_ingress_token`) → `{worker_epoch}`, then the worker API
+   of §5.2.
 
-The **controller** (webpage / this library) does none of that — it only lists,
-sends, and streams (§3). Bootstrap of Remote Control itself is a **local control-RPC**
+Bootstrap of Remote Control inside a running CLI is a **local control-RPC**
 (`this.request({subtype:"remote_control", enabled, name})`), not an HTTP call.
-
 Relevant env vars: `CLAUDE_BRIDGE_SESSION_INGRESS_URL`, `CLAUDE_BRIDGE_REATTACH_SESSION`,
 `CLAUDE_BRIDGE_OAUTH_TOKEN`, `CLAUDE_BRIDGE_BASE_URL`, `CLAUDE_CODE_REMOTE_SESSION_ID`,
-`CLAUDE_CODE_REMOTE_SEND_KEEPALIVES`. Idle limit ~10 min offline before the session times out.
+`CLAUDE_CODE_REMOTE_SEND_KEEPALIVES`.
 
 ---
 
