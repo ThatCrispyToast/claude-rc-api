@@ -391,6 +391,12 @@ def test_cli_permission_response_shapes():
     }}
     # No input → no updatedInput at all (an empty one would blank the tool's input).
     assert cli_permission_response("r1", allow=True)["response"]["response"] == {"behavior": "allow"}
+    rules = [{"type": "addRules", "behavior": "allow", "destination": "session",
+              "rules": [{"toolName": "Bash", "ruleContent": "npm test"}]}]
+    answer = cli_permission_response("r1", allow=True, updated_permissions=rules)
+    assert answer["response"]["response"]["updatedPermissions"] == rules
+    deny_with_rules = cli_permission_response("r2", allow=False, updated_permissions=rules)
+    assert "updatedPermissions" not in deny_with_rules["response"]["response"]
     deny = cli_permission_response("r2", allow=False)["response"]
     assert deny["response"] == {"behavior": "deny", "message": "Denied by controller"}
     assert "tool_use_id" not in deny

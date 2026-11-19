@@ -328,6 +328,7 @@ def cli_permission_response(
     tool_input: dict | None = None,
     tool_use_id: str | None = None,
     message: str | None = None,
+    updated_permissions: list[dict] | None = None,
 ) -> dict:
     """Answer a ``can_use_tool`` permission prompt.
 
@@ -338,6 +339,8 @@ def cli_permission_response(
     """
     if allow:
         decision: dict[str, Any] = {"behavior": "allow"}
+        if updated_permissions:
+            decision["updatedPermissions"] = updated_permissions
         if tool_input is not None:
             decision["updatedInput"] = tool_input
     else:

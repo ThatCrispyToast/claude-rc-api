@@ -59,15 +59,8 @@ DEFAULT_BASE_URL = "https://api.anthropic.com"
 CCR_BETA = "ccr-byoc-2025-07-29"
 MANAGED_AGENTS_BETA = "managed-agents-2026-04-01"
 ANTHROPIC_VERSION = "2023-06-01"
-# anthropic-client-platform value the claude.ai web app sends. Since Claude Code
-# ~2.1.220 this header is load-bearing on ingest, not telemetry: CCR ingress
-# stamps it into each ingested event's `client_platform`, and the worker treats
-# a user message as coming from a *human controller* only when that value is
-# one of `ios` / `android` / `web_claude_ai` / `desktop_app`. Any other value
-# (including the `claude_code_remote` this library sent before 0.2.1) gets the
-# message demoted to *peer* origin — "Another Claude session sent a message"
-# framing — and, depending on the worker's peer-gate policy, parked without
-# ever starting a turn (observed live on 2.1.234; 2.1.219 predates the gate).
+# Kept for compatibility with older workers. The server assigns message origin.
+# On 2026-11-19 a 2.1.328 worker read library sends as peer messages.
 CLIENT_PLATFORM = "web_claude_ai"
 USER_AGENT = f"claude-rc-api-python/{__version__}"
 # The session tag claude.ai/code shows as a pin.
@@ -588,11 +581,13 @@ class RemoteControlClient:
         tool_input: dict | None = None,
         tool_use_id: str | None = None,
         message: str | None = None,
+        updated_permissions: list[dict] | None = None,
     ) -> dict:
         """Allow or deny a ``can_use_tool`` prompt (``Event.is_blocking_control``).
         See :func:`~claude_rc.events.cli_permission_response` for the fields."""
         answer = cli_permission_response(
-            request_id, allow=allow, tool_input=tool_input, tool_use_id=tool_use_id, message=message
+            request_id, allow=allow, tool_input=tool_input, tool_use_id=tool_use_id, message=message,
+            updated_permissions=updated_permissions,
         )
         return self.send_events(session_id, [answer])
 
