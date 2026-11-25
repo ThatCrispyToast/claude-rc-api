@@ -849,9 +849,13 @@ waits on or draws from.
   was typed, and the app was seen to send that `set_model` again before the
   next message. Others arrive as `user` messages holding the command's text
   (`/effort`, `/compact`, `/sandbox`, `/clear`, `/exit`, and any it does not
-  know), for the worker to run as Claude Code would. `/fast`, sent to a
-  worker that did not advertise it, was stopped in the app instead: "/fast
-  isn't a command here."
+  know), for the worker to run as Claude Code would. `/fast` is the app's
+  own, but only for a worker that lists `fast` in its `slash_commands`:
+  then the menu offers `/fast [on|off]` ("Turn fast mode on or off") and
+  what is typed arrives as text (`/fast`, `/fast off`). For a worker that
+  does not list it the app answers "/fast isn't a command here." and sends
+  nothing. The worker reports the mode as `fast_mode_state` in
+  `system/init`, for which the web app draws nothing (verified 2026-11-25).
 - **`/clear`** arrives as that text. The transcript is emptied by a
   **`conversation_reset`** event from the worker (`new_conversation_id`,
   `trigger: "clear"`, `user_message_uuid` naming the `/clear` message,
