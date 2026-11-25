@@ -455,7 +455,7 @@ of the command output. Semantics are exactly "typed at that terminal" — so
 | `result` | **turn complete** — `{subtype: success\|error_max_turns\|error_during_execution, is_error, num_turns, duration_ms, total_cost_usd, usage, stop_reason, terminal_reason, user_message_uuid}`. `user_message_uuid`, when present, is the `uuid` of the user message that started the turn; a message sent mid-turn usually joins the running turn instead of getting a `result` of its own |
 | `stream_event` | partial streaming (ephemeral) |
 | `control_request` / `control_response` / `control_cancel_request` | the control protocol (§3.2), from either side — `source` says whose |
-| `conversation_reset` | `/clear` and its kin (`trigger: clear`, `new_conversation_id`): the events before it are no longer the conversation |
+| `conversation_reset` | `/clear` and its kin (`trigger: clear` \| `plan_mode_exit` \| `fresh_session` \| `onboarding`, `new_conversation_id`, `user_message_uuid?`, `timestamp?`): the events before it are no longer the conversation, and claude.ai stops drawing them (§5.3) |
 | `rate_limit_event`, `tool_progress`, `tool_use_summary`, `active_goal`, `auth_status`, `env_manager_log` | auxiliary UI/telemetry events |
 
 A turn ends on a **`result`** event (not `session.status_idle` — that's mode B).
@@ -716,6 +716,20 @@ the goodbye: the session shows as disconnected at once, and **stays so for
 that epoch** even if it reports state again. Coming back means claiming the
 seat again.
 
+**Leaving.** A worker that only stops leaves its session `active` and
+`disconnected`, listed among the live ones until someone archives it. Claude
+Code ends its own as it exits (read from 2.1.332): it posts
+`system/worker_shutting_down` (`reason: "host_exit"`) and a `result`, reports
+`idle`, says goodbye, and archives the session with the account's login
+(`POST …/archive`, §3.1). `RemoteControlWorker.close(archive=True)` does the
+last two, in that order, because **an archived session refuses its worker's
+calls** (409 `session_not_active`): archived first, it takes no goodbye and
+stays listed as `connected` (verified 2026-11-25). An archived session keeps
+its tags and is found with `?statuses=archived`; `…/unarchive` makes it
+`active` again, and a worker can then claim its seat as before. Tags can be
+changed on a live session (`add_tags` / `remove_tags`, §3.1), so a worker's
+bookkeeping there can follow what it serves.
+
 **Heartbeat** every `heartbeat_interval_seconds`. The CLI adds
 `supports_heartbeat_probe`, `current_interval_seconds` and `idle_seconds`, and
 on exit `release_lease: true` (from the binary).
@@ -827,13 +841,27 @@ waits on or draws from.
 - **Slash commands.** The app's `/` menu is its own list (`/btw`, `/model`,
   `/effort`, `/status`, `/usage`, `/diff`, `/compact` …) plus the worker's
   `slash_commands` from `system/init`, those shown as "Custom command". Many
-  it runs itself and never sends (`/status`, `/usage`, `/config`, `/help`,
-  `/tasks`). `/model <id>` arrives as `set_model` with whatever id was typed,
-  and the app was seen to send that `set_model` again before the next
-  message. Others arrive as `user` messages holding the command's text
-  (`/effort`, `/compact`, `/sandbox`), for the worker to run as Claude Code
-  would. `/fast`, sent to a worker that did not advertise it, was stopped in
-  the app instead: "/fast isn't a command here."
+  it runs itself and never sends as text: `/status`, `/usage`, `/config`,
+  `/help`, `/diff`; `/tasks` (opens its Background tasks panel), `/mcp`
+  (opens its own settings), `/permissions` (opens its mode menu), `/plan`
+  (`set_permission_mode`) and `/rename <title>` (retitles the session, then
+  `rename_session`). `/model <id>` arrives as `set_model` with whatever id
+  was typed, and the app was seen to send that `set_model` again before the
+  next message. Others arrive as `user` messages holding the command's text
+  (`/effort`, `/compact`, `/sandbox`, `/clear`, `/exit`, and any it does not
+  know), for the worker to run as Claude Code would. `/fast`, sent to a
+  worker that did not advertise it, was stopped in the app instead: "/fast
+  isn't a command here."
+- **`/clear`** arrives as that text. The transcript is emptied by a
+  **`conversation_reset`** event from the worker (`new_conversation_id`,
+  `trigger: "clear"`, `user_message_uuid` naming the `/clear` message,
+  `timestamp`; `worker_conversation_reset()`): the app shows "No messages
+  yet", and a session opened later shows only what came after the event.
+  The session, its title and its worker carry on (verified 2026-11-25).
+- **An archived session** reads "This session is archived" in place of the
+  message box, with an Unarchive button, as soon as it is archived. That is
+  how a worker's `/exit` shows: the answer, then the session ended (see
+  Leaving, §5.2). `system/worker_shutting_down` draws nothing in the web app.
 - **Its panels are the worker's answers.** `@` in the message box and the
   Files panel send `file_suggestions` (`""`, then what is typed, or `"dir/"`
   for a folder), a file opened there sends `read_file`, the Changes panel

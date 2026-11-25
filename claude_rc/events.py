@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 # The Claude Code version whose worker protocol the ``worker_*`` builders speak.
@@ -602,6 +603,38 @@ def worker_compact_boundary(
     if post_tokens is not None:
         metadata["post_tokens"] = post_tokens
     return {"type": RC.SYSTEM, "subtype": RCSystem.COMPACT_BOUNDARY, "compact_metadata": metadata}
+
+
+def worker_conversation_reset(
+    new_conversation_id: str, *, trigger: str = "clear", user_message_uuid: str | None = None
+) -> dict:
+    """A ``conversation_reset`` event: the worker dropped its conversation and
+    began another, as Claude Code does on ``/clear``. The session goes on, and
+    controllers show it empty from here: what came before the event is no
+    longer drawn, in a session opened later either.
+
+    ``new_conversation_id`` names the conversation that begins (a UUID) and
+    ``trigger`` what ended the last (``clear`` is the command).
+    ``user_message_uuid`` is the controller's message whose ``/clear`` this
+    answers: the app wipes its view when it sends one, and matches the event
+    to it so as to wipe once."""
+    event: dict[str, Any] = {
+        "type": RC.CONVERSATION_RESET,
+        "new_conversation_id": new_conversation_id,
+        "trigger": trigger,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+    }
+    if user_message_uuid:
+        event.update(user_message_uuid=user_message_uuid, user_message_from_human=True)
+    return event
+
+
+def worker_shutting_down(reason: str = "host_exit") -> dict:
+    """A ``system/worker_shutting_down`` event: the worker is leaving on
+    purpose, and why. Claude Code posts it as it exits (``host_exit``), with a
+    ``result`` after it, so that a controller need not wait for the heartbeats
+    to lapse to know. See :meth:`~claude_rc.worker.RemoteControlWorker.close`."""
+    return {"type": RC.SYSTEM, "subtype": RCSystem.WORKER_SHUTTING_DOWN, "reason": reason}
 
 
 # --- Outbound builders: Managed Agents -------------------------------------

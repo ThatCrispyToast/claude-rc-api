@@ -119,17 +119,32 @@ class RemoteControlWorker:
         threading.Thread(target=self._heartbeat, name=f"rc-worker-{self.session_id}", daemon=True).start()
         return self
 
-    def close(self, *, goodbye: bool = True) -> None:
+    def close(self, *, goodbye: bool = True, archive: bool = False) -> None:
         """Stop serving. With ``goodbye`` the session shows as disconnected at
         once; without it the server finds out as the heartbeats stop. The
-        session stays listed, and a later worker can claim it again."""
+        session stays listed, and a later worker can claim it again.
+
+        With ``archive`` the session is ended as well, as Claude Code ends its
+        own when it exits: it leaves the list of live sessions, and reads
+        "This session is archived" where it is open. A worker that lost its
+        seat leaves the session alone, since it is another worker's now, or
+        archived already. :meth:`RemoteControlClient.unarchive_session` brings
+        an ended session back for a worker to claim."""
         if self._closed.is_set():
             return
-        if goodbye and self.epoch is not None and self._evicted is None:
+        seated = self.epoch is not None and self._evicted is None
+        if goodbye and seated:
             try:
                 self._call("PUT", "/worker", {"connection_status": "disconnected"})
             except (httpx.HTTPError, APIError, WorkerEvicted, CredentialsError) as e:
                 log.warning("worker goodbye for %s failed: %s", self.session_id, e)
+        # After the goodbye: an archived session takes no more of its worker's
+        # calls, and one archived while connected stays listed as connected.
+        if archive and seated and self._evicted is None:
+            try:
+                self.client.archive_session(self.session_id)
+            except (httpx.HTTPError, APIError, CredentialsError) as e:
+                log.warning("could not archive %s: %s", self.session_id, e)
         self._closed.set()
         stream = self._stream
         if stream is not None:

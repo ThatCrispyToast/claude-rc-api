@@ -12,10 +12,12 @@ from claude_rc.events import (
     worker_assistant,
     worker_compact_boundary,
     worker_control_response,
+    worker_conversation_reset,
     worker_init,
     worker_initialize_response,
     worker_permission_request,
     worker_result,
+    worker_shutting_down,
     worker_status,
     worker_stream_event,
     worker_tool_result,
@@ -30,6 +32,11 @@ class _Seat:
 
     def __init__(self):
         self.claims = []
+        self.archived = []
+
+    def archive_session(self, session_id):
+        self.archived.append(session_id)
+        return True
 
     def bridge_session(self, session_id, *, expected_epoch=None):
         self.claims.append(expected_epoch)
@@ -91,6 +98,27 @@ def test_close_says_goodbye_as_the_current_epoch(api):
     worker.close()
     assert _sent(calls, "PUT", "/worker")[-1] == {"worker_epoch": 1, "connection_status": "disconnected"}
     worker.close()  # a second close is a no-op
+
+
+def test_close_can_end_the_session_once_it_has_said_goodbye(api):
+    """As Claude Code ends its own on exit. Archived first, the session would
+    take no goodbye and stay listed as connected."""
+    worker, seat, calls, answers = api
+    answers[("PUT", "/worker")] = lambda request: (
+        httpx.Response(200, json={}) if not seat.archived else httpx.Response(409, json={}))
+    worker.close(archive=True)
+    assert _sent(calls, "PUT", "/worker")[-1] == {"worker_epoch": 1, "connection_status": "disconnected"}
+    assert seat.archived == [SID]
+
+
+def test_a_worker_that_lost_its_seat_leaves_the_session_to_its_successor(api):
+    worker, seat, _, answers = api
+    answers[("POST", "/worker/events")] = httpx.Response(409, json={"error": {
+        "type": "epoch_conflict", "reason": "superseded_by_worker", "message": "epoch mismatch"}})
+    with pytest.raises(WorkerEvicted):
+        worker.send({"type": "system"})
+    worker.close(archive=True)
+    assert seat.archived == []
 
 
 def test_a_conflict_evicts_the_worker_for_good(api):
@@ -305,6 +333,19 @@ def test_a_compaction_is_a_status_and_a_boundary():
         "type": "system", "subtype": "compact_boundary", "compact_metadata": {"trigger": "auto"}}
     assert worker_compact_boundary(trigger="manual", pre_tokens=900, post_tokens=100)["compact_metadata"] == {
         "trigger": "manual", "pre_tokens": 900, "post_tokens": 100}
+
+
+def test_a_reset_names_the_new_conversation_and_the_message_that_asked():
+    reset = worker_conversation_reset("conv-2", user_message_uuid="u-1")
+    assert reset.pop("timestamp").endswith("Z")
+    assert reset == {
+        "type": "conversation_reset", "new_conversation_id": "conv-2", "trigger": "clear",
+        "user_message_uuid": "u-1", "user_message_from_human": True}
+    assert "user_message_uuid" not in worker_conversation_reset("conv-2", trigger="fresh_session")
+
+
+def test_a_worker_says_why_it_is_leaving():
+    assert worker_shutting_down() == {"type": "system", "subtype": "worker_shutting_down", "reason": "host_exit"}
 
 
 # --- the client's two hosting calls ---------------------------------------------

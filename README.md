@@ -263,6 +263,17 @@ worker.send(worker_stream_event(delta), ephemeral=True)
 worker.report_metadata(model="echo", context_usage={"used_tokens": 1200, "max_tokens": 8000})
 ```
 
+```python
+from claude_rc import worker_conversation_reset, worker_shutting_down
+
+# /clear: the app empties its transcript and the session carries on
+worker.send(worker_conversation_reset(new_id, user_message_uuid=ev.id))
+
+# leave as Claude Code does when it exits: the session is archived, not left "disconnected"
+worker.send(worker_shutting_down())
+worker.close(archive=True)             # rc.unarchive_session(sid) reopens it for a later worker
+```
+
 A session has one worker at a time. Claiming the seat evicts whoever held it,
 whose calls then raise `WorkerEvicted`; so does archiving the session. Messages
 sent while no worker was attached are delivered when one connects.
