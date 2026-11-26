@@ -18,6 +18,7 @@ officially supported interface; endpoints and headers can change without notice.
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import threading
 import time
@@ -486,6 +487,29 @@ class RemoteControlClient:
         if max_bytes is not None and len(resp.content) > max_bytes:
             raise APIError(413, f"the file is {len(resp.content)} bytes, over the {max_bytes} asked for", None)
         return resp.content
+
+    def upload_file(self, name: str, data: bytes, *, media_type: str | None = None) -> dict:
+        """``POST /api/oauth/file_upload`` — put a file in the account's store,
+        which is how a worker sends one to the app: the answer's ``file_uuid``
+        goes in the result of a ``SendUserFile`` call, and the app draws a
+        file card from it (API_REFERENCE.md §5.3). The answer also has
+        ``file_kind``, ``image`` for what the app shows as a picture and
+        ``blob`` for anything else. ``media_type`` defaults to what the name
+        suggests. Raises :class:`APIError` for a file claude.ai refuses (413
+        for one too large)."""
+        media_type = media_type or mimetypes.guess_type(name)[0] or "application/octet-stream"
+        boundary = uuid.uuid4().hex
+        shown = name.replace("\r", "").replace("\n", "").replace("\\", "\\\\").replace('"', '\\"')
+        head = (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{shown}"\r\n'
+            f"Content-Type: {media_type}\r\n\r\n"
+        )
+        resp = self._request(
+            "POST", f"{self.base_url}/api/oauth/file_upload",
+            content=head.encode() + data + f"\r\n--{boundary}--\r\n".encode(),
+            extra_headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        return self._ok(resp, 201)
 
     def bridge_session(self, session_id: str, *, expected_epoch: int | None = None) -> dict:
         """``POST /v1/code/sessions/{id}/bridge`` — claim a session's worker

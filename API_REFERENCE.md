@@ -779,6 +779,18 @@ The CLI also marks replayed history with `"historical": true`, which the
 server accepts with no visible difference, and mirrors its transcript to
 `POST /worker/internal-events` for its own resume (from the binary).
 
+**A file for the user** (verified 2026-11-25) is stored first, with the
+account's OAuth login, not the worker token: `POST /api/oauth/file_upload`, a
+`multipart/form-data` body with one part, `file` (its `filename` and
+`Content-Type`), answers **201** `{file_uuid, file_name, file_kind,
+size_bytes, media_type, created_at, …}`. `file_kind` is `image` for what the
+app shows as a picture and `blob` for anything else. `upload_file()` does it,
+and `download_file()` reads the same bytes back. The `file_uuid` then goes in
+the transcript, in the result of a `SendUserFile` call (§5.3), which is all
+Claude Code's tool of that name is. From the binary, not exercised: a file
+too large is a 413 whose `error.details.max_bytes` names the limit, which is
+never under 30 MiB, and an account has an allowance of files to upload.
+
 **Token.** `worker_jwt` lasts `expires_in` seconds (13 hours). The CLI renews
 by claiming again with `expected_epoch`. `RemoteControlWorker` does the same
 shortly before the token ends or on a 401, then reports its state under the
@@ -820,6 +832,18 @@ waits on or draws from.
   new_string}` as a file card with its diff (and an entry under Outputs). A
   worker's `user` event with text content shows as a message the user typed
   at the terminal.
+- **A file sent to the user** is a `tool_use` named `SendUserFile` (`{files:
+  [path, …], caption?}`) and its `tool_result`, whose `user` event carries
+  the tool's structured output beside its `message`: `tool_use_result:
+  {caption?, attachments: [{path, size, isImage, media_type?, file_uuid}]}`,
+  each `file_uuid` an upload's (§5.2; `worker_tool_result(…,
+  tool_use_result=…)`). The app writes the caption and draws a card for each
+  file, a picture as its thumbnail and any other by its name and size, each
+  with a download button, and lists them under Outputs. A picture opens from
+  the upload. Any other file opens in the file viewer, which asks the worker
+  for it by its `path` (`read_file`): one the worker won't read shows "Can't
+  read this file" there and still downloads. A call whose result is an error
+  reads "Sending file Failed" (verified 2026-11-25).
 - **A reply as it is written**: ephemeral `stream_event`s (`message_start`,
   `content_block_start`, `content_block_delta` with a `text_delta`,
   `content_block_stop`), then the stored `assistant` event with the same

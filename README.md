@@ -256,6 +256,14 @@ request_id = worker.request_permission("Bash", {"command": "rm -r build"},
 for attached in ev.payload.get("file_attachments") or []:
     data = rc.download_file(attached["file_uuid"])    # attached["file_name"], ["is_image"]
 
+# a file for the user: stored with the account's login, then named in the result of a
+# SendUserFile call, which the app draws as a file card (API_REFERENCE.md §5.3)
+stored = rc.upload_file("plot.png", data)
+call = {"type": "tool_use", "id": "t3", "name": "SendUserFile", "input": {"files": ["/w/plot.png"]}}
+sent = {"attachments": [{"path": "/w/plot.png", "size": len(data), "isImage": True, "file_uuid": stored["file_uuid"]}]}
+worker.send(worker_assistant([call], model="echo"),
+            worker_tool_result("t3", "1 file delivered", tool_use_result=sent))
+
 # a reply as it is written, for whoever is watching
 delta = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hel"}}
 worker.send(worker_stream_event(delta), ephemeral=True)

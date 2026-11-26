@@ -484,14 +484,19 @@ def worker_tool_result(
     *,
     is_error: bool = False,
     parent_tool_use_id: str | None = None,
+    tool_use_result: Any = None,
 ) -> dict:
     """A ``user`` event carrying a tool's result, which closes the
-    ``tool_use`` block of that id in the transcript."""
+    ``tool_use`` block of that id in the transcript. ``tool_use_result`` is
+    the tool's structured output, which the model never saw and the app
+    draws some tools from: the file cards of a ``SendUserFile`` call are its
+    ``attachments`` (API_REFERENCE.md §5.3)."""
     block = {"type": "tool_result", "tool_use_id": tool_use_id, "content": content, "is_error": is_error}
     return {
         "type": RC.USER,
         "parent_tool_use_id": parent_tool_use_id,
         "message": {"role": "user", "content": [block]},
+        **({} if tool_use_result is None else {"tool_use_result": tool_use_result}),
     }
 
 

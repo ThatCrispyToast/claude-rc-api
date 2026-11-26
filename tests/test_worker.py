@@ -301,6 +301,9 @@ def test_worker_tool_result_and_stream_event_shapes():
     result = worker_tool_result("t-1", "out", is_error=True)
     assert result["type"] == "user"
     assert result["message"]["content"] == [{"type": "tool_result", "tool_use_id": "t-1", "content": "out", "is_error": True}]
+    assert "tool_use_result" not in result
+    sent = {"attachments": [{"path": "/w/plot.png", "size": 3, "isImage": True, "file_uuid": "f-1"}]}
+    assert worker_tool_result("t-2", "1 file delivered", tool_use_result=sent)["tool_use_result"] == sent
     delta = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "h"}}
     assert worker_stream_event(delta) == {"type": "stream_event", "event": delta, "parent_tool_use_id": None}
 
@@ -393,3 +396,32 @@ def test_an_attached_file_is_downloaded_with_the_login(monkeypatch):
     with pytest.raises(APIError) as missing:
         rc.download_file("missing")
     assert missing.value.status == 404
+
+
+def test_a_file_is_uploaded_as_the_one_part_of_a_form(monkeypatch):
+    rc = RemoteControlClient.__new__(RemoteControlClient)
+    rc.base_url = "https://api.example"
+    seen = []
+
+    def fake_request(method, url, **kw):
+        seen.append((method, url, kw))
+        if b"too long" in kw["content"]:
+            return httpx.Response(413, json={"error": {"details": {"max_bytes": 3}}})
+        return httpx.Response(201, json={"file_uuid": "f-1", "file_kind": "image"})
+
+    monkeypatch.setattr(rc, "_request", fake_request)
+    assert rc.upload_file('a "plot".png', b"\x89PNG") == {"file_uuid": "f-1", "file_kind": "image"}
+    method, url, kw = seen[0]
+    assert (method, url) == ("POST", "https://api.example/api/oauth/file_upload")
+    boundary = kw["extra_headers"]["Content-Type"].removeprefix("multipart/form-data; boundary=")
+    assert kw["content"] == (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="a \\"plot\\".png"\r\n'
+        "Content-Type: image/png\r\n\r\n"
+    ).encode() + b"\x89PNG" + f"\r\n--{boundary}--\r\n".encode()
+    rc.upload_file("notes", b"hi", media_type="text/plain")
+    assert b"Content-Type: text/plain\r\n" in seen[1][2]["content"]
+    rc.upload_file("notes", b"hi")
+    assert b"Content-Type: application/octet-stream\r\n" in seen[2][2]["content"]  # a name that says nothing
+    with pytest.raises(APIError) as refused:
+        rc.upload_file("big.bin", b"too long")
+    assert refused.value.status == 413
